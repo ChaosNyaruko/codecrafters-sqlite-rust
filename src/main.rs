@@ -27,6 +27,13 @@ fn main() -> Result<()> {
             eprintln!("Logs from your program will appear here!");
 
             println!("database page size: {}", page_size);
+
+            let mut page_header = [0; 8]; // 8+4: 4 is for interior b-tree pages
+            file.read_exact(&mut page_header)?;
+            let _page_type = page_header[0];
+            let _freeblock_start = &page_header[1..3];
+            let cell_num = u16::from_be_bytes(page_header[3..5].try_into().unwrap());
+            println!("number of tables: {cell_num}")
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
