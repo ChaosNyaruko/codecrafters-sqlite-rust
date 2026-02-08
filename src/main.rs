@@ -3,6 +3,92 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs::File;
 use std::io::{SeekFrom, prelude::*};
+mod parser;
+
+struct Table {
+    cols: Vec<String>,
+}
+
+struct Tables {
+    count: usize,
+    display: String,
+    pos: HashMap<String, usize>, // key: tbl_name, value: rootpage
+    content: HashMap<String, Table>,
+}
+
+fn parse_cell_as_rows(p: &Page) -> (String, HashMap<String, usize>) {
+    let mut tables = String::new();
+    let mut table_pos = HashMap::<String, usize>::default();
+    let page = &p.page;
+    let cell_num = p.cell_num;
+    let cell_offsets = &p.cell_offsets;
+    for (ic, offset) in cell_offsets.into_iter().enumerate() {
+        let mut i = 0;
+        let buf = &page[*offset as usize..];
+        let (_size, j) = decode_varint(buf);
+        i += j;
+        let (_rowid, j) = decode_varint(&buf[i..]);
+        i += j;
+
+        // decode record header
+        let (header_size, j) = decode_varint(&buf[i..]);
+        i += j;
+        let mut serial_size = header_size as usize - j;
+        let mut serials = Vec::new();
+        while serial_size > 0 {
+            let (serial_type, j) = decode_varint(&buf[i..]);
+            i += j;
+            serial_size -= j;
+            serials.push(serial_type);
+        }
+        assert_eq!(serial_size, 0);
+
+        // decode record body
+        // type name tbl_name rootpage sql
+        let mut tbl_name = String::new();
+        let mut rootpage = 0;
+        for (f, t) in serials.into_iter().enumerate() {
+            let size = serial_type_size(t);
+            let v = col_value(t, buf, i);
+            i += size;
+            if f == 2 {
+                if let ColType::Text(ref text) = v {
+                    write!(tables, "{}", text).unwrap();
+                    tbl_name = text.clone();
+                }
+                if ic != cell_num as usize - 1 {
+                    write!(tables, " ").unwrap();
+                }
+            }
+            if f == 3 {
+                if let ColType::Integer(o) = v {
+                    rootpage = o as usize;
+                }
+            }
+            if f == 4 {
+                if let ColType::Text(sql) = v {
+                    let cols =
+                        parser::parse_create(&sql).expect(&format!("parse create err: {sql}"));
+                    eprintln!("create: {cols:?}");
+                }
+            }
+        }
+        table_pos.insert(tbl_name, rootpage);
+    }
+    return (tables, table_pos);
+}
+
+impl Tables {
+    fn new(db: &DBInfo, p: &Page) -> Option<Self> {
+        let (tables, table_pos) = parse_cell_as_rows(p);
+        return Some(Tables {
+            count: db.table_count,
+            display: tables,
+            pos: table_pos,
+            content: HashMap::new(),
+        });
+    }
+}
 
 struct DBInfo {
     page_size: u16,
@@ -15,9 +101,9 @@ struct Page {
     _freeblock_start: u16,
     cell_num: u16,
     cell_content_area: u16,
+    page: Vec<u8>,
 
-    tables: String,
-    table_pos: HashMap<String, usize>,
+    cell_offsets: Vec<u16>,
 }
 
 fn parse_dbinfo(reader: &mut File) -> Result<DBInfo> {
@@ -67,7 +153,6 @@ fn parse_page(idx: usize, reader: &mut File, dbinfo: &DBInfo) -> Result<Page> {
     let freeblock_start = u16::from_be_bytes(page_header[1..3].try_into().unwrap());
     let cell_num = u16::from_be_bytes(page_header[3..5].try_into().unwrap());
     let cell_content_area = u16::from_be_bytes(page_header[5..7].try_into().unwrap());
-    let mut tables = "".to_string();
     let mut cell_offsets = Vec::new();
     let mut i = 8; // TODO: interior offset: 4, has been asserted in header parsing.
     for _ in 0..cell_num {
@@ -76,66 +161,14 @@ fn parse_page(idx: usize, reader: &mut File, dbinfo: &DBInfo) -> Result<Page> {
         ));
         i += 2;
     }
-    let mut table_pos = HashMap::default();
-    for (ic, offset) in cell_offsets.into_iter().enumerate() {
-        let mut i = 0;
-        let buf = &page[offset as usize..];
-        let (size, j) = decode_varint(buf);
-        i += j;
-        let (rowid, j) = decode_varint(&buf[i..]);
-        i += j;
 
-        // decode record header
-        let (header_size, j) = decode_varint(&buf[i..]);
-        i += j;
-        let mut serial_size = header_size as usize - j;
-        let mut serials = Vec::new();
-        while serial_size > 0 {
-            let (serial_type, j) = decode_varint(&buf[i..]);
-            i += j;
-            serial_size -= j;
-            serials.push(serial_type);
-        }
-        assert_eq!(serial_size, 0);
-
-        // decode record body
-        // type name tbl_name rootpage sql
-        if idx == 0 {
-            let mut tbl_name = String::new();
-            let mut rootpage = 0;
-            for (f, t) in serials.into_iter().enumerate() {
-                let size = serial_type_size(t);
-                let v = col_value(t, buf, i);
-                i += size;
-                if f == 2 {
-                    if let ColType::Text(ref text) = v {
-                        write!(tables, "{}", text).unwrap();
-                        tbl_name = text.clone();
-                    } else {
-                        bail!("bad tbl_name value: {:?}", v);
-                    }
-                    if ic != cell_num as usize - 1 {
-                        write!(tables, " ").unwrap();
-                    }
-                }
-                if f == 3 {
-                    if let ColType::Integer(o) = v {
-                        rootpage = o as usize;
-                    } else {
-                        bail!("bad rootpage value: {:?}", v);
-                    }
-                }
-            }
-            table_pos.insert(tbl_name, rootpage);
-        }
-    }
     let p = Page {
         _page_type: page_type,
         _freeblock_start: freeblock_start,
         cell_num,
         cell_content_area,
-        tables,
-        table_pos,
+        cell_offsets,
+        page,
     };
     return Ok(p);
 }
@@ -162,20 +195,21 @@ fn main() -> Result<()> {
         ".tables" => {
             let db = parse_dbinfo(&mut file)?;
             let p = parse_page(0, &mut file, &db)?;
-            println!("{}", p.tables);
+            let t = Tables::new(&db, &p).expect("not getting legal tables");
+            println!("{}", t.display);
         }
-        statement => {
+        statement if !statement.starts_with(".") => {
+            let select = parser::parse_select(statement).expect("parse select err");
+            eprintln!("select: {select:?}");
+            let table = select.table;
             let db = parse_dbinfo(&mut file)?;
             let p = parse_page(0, &mut file, &db)?;
-            let table = statement.split(' ').last();
-            if let Some(name) = table {
-                let root = p.table_pos.get(name).expect(&format!("{} not exists", name));
-                let t = parse_page(*root - 1, &mut file, &db)?;
-                println!("{}", t.cell_num)
-            } else {
-                bail!("Missing or invalid command passed: {}", command)
-            }
+            let t = Tables::new(&db, &p).expect("not getting legal tables");
+            let root = t.pos.get(&table).expect(&format!("{} not exists", table));
+            let t = parse_page(*root - 1, &mut file, &db)?;
+            println!("{}", t.cell_num);
         }
+        _ => bail!("Missing or invalid command passed: {}", command),
     }
 
     Ok(())
