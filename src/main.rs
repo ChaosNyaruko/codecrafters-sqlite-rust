@@ -1,26 +1,73 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::fs::File;
 use std::io::{SeekFrom, prelude::*};
 mod parser;
 
-struct Table {
-    cols: Vec<String>,
-}
+#[derive(Debug)]
+struct Tables<'r> {
+    dbinfo: DBInfo,
+    reader: &'r File,
 
-struct Tables {
-    count: usize,
+    // state
+    cur_tbl_name: String,
+    cur_rootpage: usize,
+    cur_create: parser::CreateTableStmt,
+
     display: String,
     pos: HashMap<String, usize>, // key: tbl_name, value: rootpage
-    content: HashMap<String, Table>,
+    content: HashMap<String, parser::CreateTableStmt>, // key: tbl_name, value: Table with column names
 }
 
-fn parse_cell_as_rows(p: &Page) -> (String, HashMap<String, usize>) {
-    let mut tables = String::new();
-    let mut table_pos = HashMap::<String, usize>::default();
+trait OnColumn {
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType);
+    fn on_row(&mut self);
+    fn finalize(&mut self);
+}
+
+impl<'r> OnColumn for Tables<'r> {
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
+        // schema: type name tbl_name rootpage sql
+        if col == 2 {
+            if let ColType::Text(text) = v {
+                write!(self.display, "{}", text).unwrap();
+                self.cur_tbl_name = text.clone();
+            }
+            if row != self.dbinfo.table_count as usize - 1 {
+                write!(self.display, " ").unwrap();
+            }
+        }
+        if col == 3 {
+            if let ColType::Integer(o) = v {
+                self.cur_rootpage = *o as usize;
+            }
+        }
+        if col == 4 {
+            if let ColType::Text(sql) = v {
+                let cols = parser::parse_create(&sql).expect(&format!("parse create err: {sql}"));
+                // eprintln!("create: {cols:?}");
+                self.cur_create = cols;
+            }
+        }
+    }
+
+    fn on_row(&mut self) {
+        self.pos
+            .insert(self.cur_tbl_name.clone(), self.cur_rootpage);
+        assert_eq!(
+            self.cur_tbl_name, self.cur_create.table,
+            "create table name should be consistent with the tbl_name field"
+        );
+        self.content
+            .insert(self.cur_tbl_name.clone(), self.cur_create.clone());
+    }
+
+    fn finalize(&mut self) {}
+}
+
+fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn) {
     let page = &p.page;
-    let cell_num = p.cell_num;
     let cell_offsets = &p.cell_offsets;
     for (ic, offset) in cell_offsets.into_iter().enumerate() {
         let mut i = 0;
@@ -44,52 +91,83 @@ fn parse_cell_as_rows(p: &Page) -> (String, HashMap<String, usize>) {
         assert_eq!(serial_size, 0);
 
         // decode record body
-        // type name tbl_name rootpage sql
-        let mut tbl_name = String::new();
-        let mut rootpage = 0;
         for (f, t) in serials.into_iter().enumerate() {
             let size = serial_type_size(t);
             let v = col_value(t, buf, i);
             i += size;
-            if f == 2 {
-                if let ColType::Text(ref text) = v {
-                    write!(tables, "{}", text).unwrap();
-                    tbl_name = text.clone();
-                }
-                if ic != cell_num as usize - 1 {
-                    write!(tables, " ").unwrap();
-                }
-            }
-            if f == 3 {
-                if let ColType::Integer(o) = v {
-                    rootpage = o as usize;
-                }
-            }
-            if f == 4 {
-                if let ColType::Text(sql) = v {
-                    let cols =
-                        parser::parse_create(&sql).expect(&format!("parse create err: {sql}"));
-                    eprintln!("create: {cols:?}");
-                }
-            }
+            state.on_col(ic, f, &v);
         }
-        table_pos.insert(tbl_name, rootpage);
+        state.on_row();
     }
-    return (tables, table_pos);
+    state.finalize();
 }
 
-impl Tables {
-    fn new(db: &DBInfo, p: &Page) -> Option<Self> {
-        let (tables, table_pos) = parse_cell_as_rows(p);
-        return Some(Tables {
-            count: db.table_count,
-            display: tables,
-            pos: table_pos,
+impl<'r> Tables<'r> {
+    fn new(db: &DBInfo, p: &Page, reader: &'r File) -> Option<Self> {
+        let mut res = Tables {
+            dbinfo: *db,
+            reader: reader,
+            display: String::new(),
+            pos: HashMap::new(),
             content: HashMap::new(),
-        });
+            cur_tbl_name: String::new(),
+            cur_rootpage: 0,
+            cur_create: Default::default(),
+        };
+
+        parse_cell_as_rows(p, &mut res);
+        // eprintln!("table: {:?}", res);
+        return Some(res);
+    }
+
+    fn select(&self, table: &String, cols: Vec<String>) -> Result<()> {
+        let t = self
+            .content
+            .get(table)
+            .expect(&format!("cannot find table: {table}"));
+        let rootpage = self
+            .pos
+            .get(table)
+            .expect(&format!("cannot find table: {table}"));
+        let p = parse_page(rootpage - 1, self.reader, &self.dbinfo).expect(&format!(
+            "cannot parse page {} for table: {}",
+            rootpage, table
+        ));
+        for col in cols {
+            let col_index = t
+                .columns
+                .iter()
+                .enumerate()
+                .find(|c| c.1.name == col)
+                .context(format!("cannot find column {} for table: {}", col, table))?;
+            let mut cp = ColPrint {
+                col_index: col_index.0,
+            };
+            parse_cell_as_rows(&p, &mut cp);
+        }
+
+        Ok(())
     }
 }
 
+struct ColPrint {
+    col_index: usize,
+}
+
+impl OnColumn for ColPrint {
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
+        if col != self.col_index {
+            return;
+        }
+        println!("{}", v);
+    }
+
+    fn on_row(&mut self) {}
+
+    fn finalize(&mut self) {}
+}
+
+#[derive(Debug, Copy, Clone)]
 struct DBInfo {
     page_size: u16,
     text_encoding: u32,
@@ -130,7 +208,7 @@ fn parse_dbinfo(reader: &mut File) -> Result<DBInfo> {
     Ok(db)
 }
 
-fn parse_page(idx: usize, reader: &mut File, dbinfo: &DBInfo) -> Result<Page> {
+fn parse_page<'r>(idx: usize, mut reader: &'r File, dbinfo: &DBInfo) -> Result<Page> {
     let page_size = dbinfo.page_size as usize;
     let offset = idx * page_size;
     let mut page = vec![0; page_size];
@@ -195,19 +273,23 @@ fn main() -> Result<()> {
         ".tables" => {
             let db = parse_dbinfo(&mut file)?;
             let p = parse_page(0, &mut file, &db)?;
-            let t = Tables::new(&db, &p).expect("not getting legal tables");
+            let t = Tables::new(&db, &p, &mut file).expect("not getting legal tables");
             println!("{}", t.display);
         }
         statement if !statement.starts_with(".") => {
             let select = parser::parse_select(statement).expect("parse select err");
-            eprintln!("select: {select:?}");
+            // eprintln!("select: {select:?}");
             let table = select.table;
             let db = parse_dbinfo(&mut file)?;
             let p = parse_page(0, &mut file, &db)?;
-            let t = Tables::new(&db, &p).expect("not getting legal tables");
-            let root = t.pos.get(&table).expect(&format!("{} not exists", table));
-            let t = parse_page(*root - 1, &mut file, &db)?;
-            println!("{}", t.cell_num);
+            let t = Tables::new(&db, &p, &mut file).expect("not getting legal tables");
+            t.select(&table, select.columns).unwrap_or_else(|_| {
+                let root = t.pos.get(&table).expect(&format!("{} not exists", table));
+                let p = parse_page(*root - 1, &mut file, &db)
+                    .context("parse page err")
+                    .unwrap();
+                println!("{}", p.cell_num);
+            });
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
@@ -223,6 +305,19 @@ enum ColType {
     Reserved,
     Blob(usize),
     Text(String),
+}
+
+impl fmt::Display for ColType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ColType::Null => write!(f, "NULL"),
+            ColType::Integer(v) => write!(f, "{v}"),
+            ColType::Float(v) => write!(f, "{v}"),
+            ColType::Reserved => write!(f, "RESERVED"),
+            ColType::Blob(size) => write!(f, "BLOB({size})"),
+            ColType::Text(s) => write!(f, "{}", s),
+        }
+    }
 }
 
 fn col_value(serial_type: i64, buf: &[u8], start: usize) -> ColType {

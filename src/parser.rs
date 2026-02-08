@@ -93,13 +93,13 @@ pub fn parse_select(sql: &str) -> Result<SelectStmt, String> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 pub struct CreateTableStmt {
     pub table: String,
     pub columns: Vec<ColumnDef>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ColumnDef {
     pub name: String,
     pub ty: Option<String>,
