@@ -45,6 +45,7 @@ impl<'r> OnColumn for Tables<'r> {
         }
         if col == 4 {
             if let ColType::Text(sql) = v {
+                eprintln!("sql:{}", sql);
                 let cols = parser::parse_create(&sql).expect(&format!("parse create err: {sql}"));
                 // eprintln!("create: {cols:?}");
                 self.cur_create = cols;
@@ -133,6 +134,7 @@ impl<'r> Tables<'r> {
             "cannot parse page {} for table: {}",
             rootpage, table
         ));
+        let mut indices = Vec::new();
         for col in cols {
             let col_index = t
                 .columns
@@ -140,29 +142,36 @@ impl<'r> Tables<'r> {
                 .enumerate()
                 .find(|c| c.1.name == col)
                 .context(format!("cannot find column {} for table: {}", col, table))?;
-            let mut cp = ColPrint {
-                col_index: col_index.0,
-            };
-            parse_cell_as_rows(&p, &mut cp);
+            indices.push(col_index.0);
         }
+        eprintln!("create {:?}, indices:{:?}", t.columns, indices);
+        let mut cp = ColsPrint {
+            col_indices: indices,
+            per_row: Vec::new(),
+        };
+        parse_cell_as_rows(&p, &mut cp);
 
         Ok(())
     }
 }
 
-struct ColPrint {
-    col_index: usize,
+struct ColsPrint {
+    col_indices: Vec<usize>,
+    per_row: Vec<String>,
 }
 
-impl OnColumn for ColPrint {
+impl OnColumn for ColsPrint {
     fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
-        if col != self.col_index {
-            return;
+        eprintln!("{row}, {col}, {v}");
+        if self.col_indices.contains(&col) {
+            self.per_row.push(v.to_string());
         }
-        println!("{}", v);
     }
 
-    fn on_row(&mut self) {}
+    fn on_row(&mut self) {
+        println!("{}", self.per_row.join("|"));
+        self.per_row.clear();
+    }
 
     fn finalize(&mut self) {}
 }
