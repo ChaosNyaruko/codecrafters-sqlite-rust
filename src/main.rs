@@ -24,6 +24,7 @@ trait OnColumn {
     fn on_col(&mut self, row: usize, col: usize, v: &ColType);
     fn on_row(&mut self);
     fn finalize(&mut self);
+    fn set_type(&mut self, t: u8);
 }
 
 impl<'r> OnColumn for Tables<'r> {
@@ -65,10 +66,13 @@ impl<'r> OnColumn for Tables<'r> {
     }
 
     fn finalize(&mut self) {}
+
+    fn set_type(&mut self, _t: u8) {}
 }
 
 fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBInfo) {
     let page = &p.page;
+    state.set_type(p.page_type);
     let cell_offsets = &p.cell_offsets;
     for (ic, offset) in cell_offsets.into_iter().enumerate() {
         let mut buf = &page[*offset as usize..];
@@ -84,7 +88,7 @@ fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBI
             let M = ((U - 12) * 32 / 255) - 23;
             let P = size as usize;
             let K = M + ((P - M) % (U - 4));
-            let mut onpage; 
+            let mut onpage;
             if P <= X {
                 // no overflow
             } else if K <= X {
@@ -134,23 +138,23 @@ fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBI
                 i += size;
                 state.on_col(ic, f, &v);
             }
+            state.on_row();
         } else if p.page_type == 0x05 {
             let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
             i += 4;
             let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
             let (rowid, j) = decode_varint(&buf[i..]);
             i += j;
-            parse_cell_as_rows(&left_page, &mut MockCol {}, reader, db);
-            eprintln!("0x05 interior key/rowid: {rowid}");
+            parse_cell_as_rows(&left_page, state, reader, db);
+            // eprintln!("0x05 interior key/rowid: {rowid}");
         } else {
             unimplemented!("parse cell for {}", p.page_type);
         }
-        state.on_row();
     }
 
     if p.page_type == 0x05 {
         let right_page = parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
-        parse_cell_as_rows(&right_page, &mut MockCol {}, reader, db);
+        parse_cell_as_rows(&right_page, state, reader, db);
     }
     state.finalize();
 }
@@ -179,7 +183,7 @@ impl<'r> Tables<'r> {
         cols: Vec<String>,
         conditions: Vec<parser::Condition>,
     ) -> Result<()> {
-        // eprintln!("conds: {:?}", conditions);
+        eprintln!("conds: {:?}", conditions);
         let t = self
             .content
             .get(table)
@@ -212,6 +216,7 @@ impl<'r> Tables<'r> {
             per_row: vec!["".to_string(); len],
             filtered: false,
             conditions: conditions,
+            cur_type: 0,
         };
         parse_cell_as_rows(&p, &mut cp, self.reader, self.dbinfo);
 
@@ -230,6 +235,8 @@ impl OnColumn for MockCol {
     }
 
     fn finalize(&mut self) {}
+
+    fn set_type(&mut self, t: u8) {}
 }
 
 struct ColsPrint {
@@ -237,43 +244,60 @@ struct ColsPrint {
     per_row: Vec<String>,
     filtered: bool,
     conditions: Vec<parser::Condition>,
+    cur_type: u8,
 }
 
 impl OnColumn for ColsPrint {
     fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
+        // eprintln!("on_col: 0x{:0x}, {}, {}, {}", self.cur_type, row, col, v);
         // [3,1,2]
         // [1,2,3]
         // stored: name, color
         // select: color name
         // select name from xxx where color = 'Yellow';
         // TODO: We only support AND for now.
-        if let Some((i, col)) = self
-            .col_indices
-            .iter()
-            .enumerate()
-            .find(|c| (*c.1).0 == col)
-        {
-            for cond in &self.conditions {
-                assert_eq!(cond.op, "=");
-                // eprintln!("col: {}, expected: {}", col.1, v.to_string());
-                if col.1 == cond.column && v.to_string() != cond.value {
-                    self.filtered = true;
-                    break;
+        if self.cur_type == 0x0d {
+            if let Some((i, col)) = self
+                .col_indices
+                .iter()
+                .enumerate()
+                .find(|c| (*c.1).0 == col)
+            {
+                for cond in &self.conditions {
+                    assert_eq!(cond.op, "=");
+                    eprintln!(
+                        "col: {} - {} - {}, expected: {}",
+                        col.1,
+                        cond.column,
+                        v.to_string(),
+                        cond.value,
+                    );
+                    if col.1 == cond.column && v.to_string() != cond.value {
+                        self.filtered = true;
+                        break;
+                    }
                 }
+                self.per_row[i] = v.to_string();
             }
-            self.per_row[i] = v.to_string();
         }
     }
 
     fn on_row(&mut self) {
-        if !self.filtered {
-            println!("{}", self.per_row.join("|"));
+        if self.cur_type == 0x0d {
+            if !self.filtered {
+                println!("{}", self.per_row.join("|"));
+            }
+            self.per_row.resize(self.per_row.len(), "".to_string());
+            self.filtered = false;
         }
-        self.per_row.resize(self.per_row.len(), "".to_string());
-        self.filtered = false;
     }
 
     fn finalize(&mut self) {}
+
+    fn set_type(&mut self, t: u8) {
+        eprintln!("set type: {}", t);
+        self.cur_type = t
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
