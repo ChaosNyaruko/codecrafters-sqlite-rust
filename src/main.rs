@@ -297,7 +297,7 @@ impl OnColumn for ColsPrint {
     fn finalize(&mut self) {}
 
     fn set_type(&mut self, t: u8) {
-        eprintln!("set type: {}", t);
+        // eprintln!("set type: {}", t);
         self.cur_type = t
     }
 }
