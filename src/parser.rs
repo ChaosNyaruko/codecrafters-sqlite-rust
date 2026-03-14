@@ -105,9 +105,17 @@ pub struct ColumnDef {
     pub ty: Option<String>,
 }
 
+// static CREATE_RE: Lazy<Regex> = Lazy::new(|| {
+//     Regex::new(
+//         r"(?is)^\s*create\s+table\s+(?P<table>\w+)\s*\(\s*(?P<body>.*?)\s*\)\s*;?\s*$")
+//         .unwrap()
+// });
+
 static CREATE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?is)^\s*create\s+table\s+(?P<table>\w+)\s*\(\s*(?P<body>.*?)\s*\)\s*;?\s*$")
-        .unwrap()
+    Regex::new(
+        r#"(?is)^\s*create\s+table\s+(?P<table>"[^"]+"|\w+)\s*\(\s*(?P<body>.*?)\s*\)\s*;?\s*$"#,
+    )
+    .unwrap()
 });
 
 static COL_RE: Lazy<Regex> =
