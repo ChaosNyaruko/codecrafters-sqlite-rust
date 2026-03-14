@@ -21,14 +21,14 @@ struct Tables<'r> {
 }
 
 trait OnColumn {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType);
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64);
     fn on_row(&mut self);
     fn finalize(&mut self);
     fn set_type(&mut self, t: u8);
 }
 
 impl<'r> OnColumn for Tables<'r> {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
         // schema: type name tbl_name rootpage sql
         if col == 2 {
             if let ColType::Text(text) = v {
@@ -82,7 +82,7 @@ fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBI
         if p.page_type == 0x0d {
             let (size, j1) = decode_varint(buf);
             i += j1;
-            let (_rowid, j2) = decode_varint(&buf[i..]);
+            let (rowid, j2) = decode_varint(&buf[i..]);
             i += j2;
 
             let U = db.page_size as usize;
@@ -138,7 +138,7 @@ fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBI
                 let size = serial_type_size(t);
                 let v = col_value(t, buf, i);
                 i += size;
-                state.on_col(ic, f, &v);
+                state.on_col(ic, f, &v, rowid);
             }
             state.on_row();
         } else if p.page_type == 0x05 {
@@ -228,7 +228,7 @@ impl<'r> Tables<'r> {
 
 struct MockCol;
 impl OnColumn for MockCol {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
         eprintln!("on_col {row}, {col}, {v}");
     }
 
@@ -250,8 +250,8 @@ struct ColsPrint {
 }
 
 impl OnColumn for ColsPrint {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
-        eprintln!("on_col: 0x{:0x}, {}, {}, {}", self.cur_type, row, col, v);
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
+        eprintln!("on_col: 0x{:0x}, {}, {}, {}, {}", self.cur_type, row, col, v, rowid);
         // [3,1,2]
         // [1,2,3]
         // stored: name, color
