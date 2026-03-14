@@ -67,38 +67,90 @@ impl<'r> OnColumn for Tables<'r> {
     fn finalize(&mut self) {}
 }
 
-fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn) {
+fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBInfo) {
     let page = &p.page;
     let cell_offsets = &p.cell_offsets;
     for (ic, offset) in cell_offsets.into_iter().enumerate() {
+        let mut buf = &page[*offset as usize..];
         let mut i = 0;
-        let buf = &page[*offset as usize..];
-        let (_size, j) = decode_varint(buf);
-        i += j;
-        let (_rowid, j) = decode_varint(&buf[i..]);
-        i += j;
+        if p.page_type == 0x0d {
+            let (size, j1) = decode_varint(buf);
+            i += j1;
+            let (_rowid, j2) = decode_varint(&buf[i..]);
+            i += j2;
 
-        // decode record header
-        let (header_size, j) = decode_varint(&buf[i..]);
-        i += j;
-        let mut serial_size = header_size as usize - j;
-        let mut serials = Vec::new();
-        while serial_size > 0 {
-            let (serial_type, j) = decode_varint(&buf[i..]);
+            let U = db.page_size as usize;
+            let X = U - 35;
+            let M = ((U - 12) * 32 / 255) - 23;
+            let P = size as usize;
+            let K = M + ((P - M) % (U - 4));
+            let mut onpage; 
+            if P <= X {
+                // no overflow
+            } else if K <= X {
+                // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
+                onpage = buf[i..i + K].to_vec();
+                let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
+                while next != 0 {
+                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                    onpage.extend(&op.page[4..]);
+                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+                }
+                buf = &onpage;
+                i = 0;
+            } else if K > X {
+                // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
+                onpage = buf[i..i + M].to_vec();
+                let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
+                while next != 0 {
+                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                    onpage.extend(&op.page[4..]);
+                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+                }
+                buf = &onpage;
+                i = 0;
+            } else {
+                unreachable!();
+            }
+
+            // payload
+            // decode record header
+            let (header_size, j) = decode_varint(&buf[i..]);
             i += j;
-            serial_size -= j;
-            serials.push(serial_type);
-        }
-        assert_eq!(serial_size, 0);
+            let mut serial_size = header_size as usize - j;
+            let mut serials = Vec::new();
+            while serial_size > 0 {
+                let (serial_type, j) = decode_varint(&buf[i..]);
+                i += j;
+                serial_size -= j;
+                serials.push(serial_type);
+            }
+            assert_eq!(serial_size, 0);
 
-        // decode record body
-        for (f, t) in serials.into_iter().enumerate() {
-            let size = serial_type_size(t);
-            let v = col_value(t, buf, i);
-            i += size;
-            state.on_col(ic, f, &v);
+            // decode record body
+            for (f, t) in serials.into_iter().enumerate() {
+                let size = serial_type_size(t);
+                let v = col_value(t, buf, i);
+                i += size;
+                state.on_col(ic, f, &v);
+            }
+        } else if p.page_type == 0x05 {
+            let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
+            i += 4;
+            let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
+            let (rowid, j) = decode_varint(&buf[i..]);
+            i += j;
+            parse_cell_as_rows(&left_page, &mut MockCol {}, reader, db);
+            eprintln!("0x05 interior key/rowid: {rowid}");
+        } else {
+            unimplemented!("parse cell for {}", p.page_type);
         }
         state.on_row();
+    }
+
+    if p.page_type == 0x05 {
+        let right_page = parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
+        parse_cell_as_rows(&right_page, &mut MockCol {}, reader, db);
     }
     state.finalize();
 }
@@ -116,7 +168,7 @@ impl<'r> Tables<'r> {
             cur_create: Default::default(),
         };
 
-        parse_cell_as_rows(p, &mut res);
+        parse_cell_as_rows(p, &mut res, reader, *db);
         // eprintln!("table: {:?}", res);
         return Some(res);
     }
@@ -136,7 +188,7 @@ impl<'r> Tables<'r> {
             .pos
             .get(table)
             .expect(&format!("cannot find table: {table}"));
-        let p = parse_page(rootpage - 1, self.reader, &self.dbinfo).expect(&format!(
+        let p = parse_page(rootpage - 1, self.reader, &self.dbinfo, false).expect(&format!(
             "cannot parse page {} for table: {}",
             rootpage, table
         ));
@@ -161,10 +213,23 @@ impl<'r> Tables<'r> {
             filtered: false,
             conditions: conditions,
         };
-        parse_cell_as_rows(&p, &mut cp);
+        parse_cell_as_rows(&p, &mut cp, self.reader, self.dbinfo);
 
         Ok(())
     }
+}
+
+struct MockCol;
+impl OnColumn for MockCol {
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
+        eprintln!("on_col {row}, {col}, {v}");
+    }
+
+    fn on_row(&mut self) {
+        eprintln!("on_row");
+    }
+
+    fn finalize(&mut self) {}
 }
 
 struct ColsPrint {
@@ -176,7 +241,6 @@ struct ColsPrint {
 
 impl OnColumn for ColsPrint {
     fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
-        // eprintln!("{row}, {col}, {v}");
         // [3,1,2]
         // [1,2,3]
         // stored: name, color
@@ -220,13 +284,15 @@ struct DBInfo {
 }
 
 struct Page {
-    _page_type: u8,
+    page_type: u8,
     _freeblock_start: u16,
     cell_num: u16,
     cell_content_area: u16,
     page: Vec<u8>,
 
     cell_offsets: Vec<u16>,
+
+    right: Option<u32>,
 }
 
 fn parse_dbinfo(reader: &mut File) -> Result<DBInfo> {
@@ -237,6 +303,7 @@ fn parse_dbinfo(reader: &mut File) -> Result<DBInfo> {
     if text_encoding != 1 {
         panic!("unsupported text encoding {}", text_encoding);
     }
+    assert_eq!(header[20], 0); // Bytes of unused "reserved" space at the end of each page. Usually 0. 
 
     // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
     #[allow(unused_variables)]
@@ -247,37 +314,59 @@ fn parse_dbinfo(reader: &mut File) -> Result<DBInfo> {
         table_count: 0,
     };
 
-    let page = parse_page(0, reader, &mut db)?;
+    let page = parse_page(0, reader, &mut db, false)?;
     db.table_count = page.cell_num as usize;
 
     Ok(db)
 }
 
-fn parse_page<'r>(idx: usize, mut reader: &'r File, dbinfo: &DBInfo) -> Result<Page> {
+fn parse_page<'r>(
+    idx: usize,
+    mut reader: &'r File,
+    dbinfo: &DBInfo,
+    overflow: bool,
+) -> Result<Page> {
     let page_size = dbinfo.page_size as usize;
     let offset = idx * page_size;
     let mut page = vec![0; page_size];
     reader.seek(SeekFrom::Start(offset as u64))?;
     reader.read_exact(&mut page)?;
+    if overflow {
+        return Ok(Page {
+            page_type: 0,
+            _freeblock_start: 0,
+            cell_num: 0,
+            cell_content_area: 0,
+            page: page,
+            cell_offsets: Vec::new(),
+            right: None,
+        });
+    }
 
     let page_header = if idx == 0 {
         &page[100..108]
     } else {
-        &page[0..8]
+        &page[0..12]
     };
 
     let page_after_fh = if idx == 0 { &page[100..] } else { &page };
 
     let page_type = page_header[0];
     assert!(
-        page_type == 0x0a || page_type == 0x0d,
-        "we only support leaf page now"
+        page_type == 0x0d || page_type == 0x05,
+        "we only support leaf page now, but got {page_type}"
     );
+    let is_leaf = page_type == 0x0d || page_type == 0x0a;
     let freeblock_start = u16::from_be_bytes(page_header[1..3].try_into().unwrap());
     let cell_num = u16::from_be_bytes(page_header[3..5].try_into().unwrap());
     let cell_content_area = u16::from_be_bytes(page_header[5..7].try_into().unwrap());
     let mut cell_offsets = Vec::new();
-    let mut i = 8; // TODO: interior offset: 4, has been asserted in header parsing.
+    let mut i = if is_leaf { 8 } else { 12 };
+    let right = if !is_leaf {
+        Some(u32::from_be_bytes(page_header[8..12].try_into().unwrap()))
+    } else {
+        None
+    };
     for _ in 0..cell_num {
         cell_offsets.push(u16::from_be_bytes(
             page_after_fh[i..i + 2].try_into().unwrap(),
@@ -286,12 +375,13 @@ fn parse_page<'r>(idx: usize, mut reader: &'r File, dbinfo: &DBInfo) -> Result<P
     }
 
     let p = Page {
-        _page_type: page_type,
+        page_type,
         _freeblock_start: freeblock_start,
         cell_num,
         cell_content_area,
         cell_offsets,
         page,
+        right,
     };
     return Ok(p);
 }
@@ -317,7 +407,7 @@ fn main() -> Result<()> {
         }
         ".tables" => {
             let db = parse_dbinfo(&mut file)?;
-            let p = parse_page(0, &mut file, &db)?;
+            let p = parse_page(0, &mut file, &db, false)?;
             let t = Tables::new(&db, &p, &mut file).expect("not getting legal tables");
             println!("{}", t.display);
         }
@@ -326,12 +416,12 @@ fn main() -> Result<()> {
             // eprintln!("select: {select:?}");
             let table = select.table;
             let db = parse_dbinfo(&mut file)?;
-            let p = parse_page(0, &mut file, &db)?;
+            let p = parse_page(0, &mut file, &db, false)?;
             let t = Tables::new(&db, &p, &mut file).expect("not getting legal tables");
             t.select(&table, select.columns, select.conditions)
                 .unwrap_or_else(|_| {
                     let root = t.pos.get(&table).expect(&format!("{} not exists", table));
-                    let p = parse_page(*root - 1, &mut file, &db)
+                    let p = parse_page(*root - 1, &mut file, &db, false)
                         .context("parse page err")
                         .unwrap();
                     println!("{}", p.cell_num);
@@ -407,7 +497,7 @@ fn serial_type_size(serial_type: i64) -> usize {
         3 => 3,
         4 => 4,
         5 => 6,
-        6 => 7,
+        6 => 8,
         7 => 8, // 64-bit floating pointer
         8 => 0,
         9 => 0,
