@@ -263,7 +263,7 @@ impl OnColumn for ColsPrint {
                 .col_indices
                 .iter()
                 .enumerate()
-                .find(|c| (*c.1).0 == col)
+                .find(|c| (*c.1).0 == col + 1)
             {
                 for cond in &self.conditions {
                     assert_eq!(cond.op, "=");
