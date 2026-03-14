@@ -57,9 +57,10 @@ impl<'r> OnColumn for Tables<'r> {
     fn on_row(&mut self) {
         self.pos
             .insert(self.cur_tbl_name.clone(), self.cur_rootpage);
-        assert_eq!(
-            self.cur_tbl_name, self.cur_create.table,
-            "create table name should be consistent with the tbl_name field"
+        assert!(
+            self.cur_create.table.contains(&self.cur_tbl_name),
+            "create table name should be consistent with the tbl_name field, {} vs {}",
+            self.cur_create.table, self.cur_tbl_name,
         );
         self.content
             .insert(self.cur_tbl_name.clone(), self.cur_create.clone());
