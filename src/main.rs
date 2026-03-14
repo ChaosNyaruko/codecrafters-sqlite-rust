@@ -251,7 +251,7 @@ struct ColsPrint {
 
 impl OnColumn for ColsPrint {
     fn on_col(&mut self, row: usize, col: usize, v: &ColType) {
-        // eprintln!("on_col: 0x{:0x}, {}, {}, {}", self.cur_type, row, col, v);
+        eprintln!("on_col: 0x{:0x}, {}, {}, {}", self.cur_type, row, col, v);
         // [3,1,2]
         // [1,2,3]
         // stored: name, color
