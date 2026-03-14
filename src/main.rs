@@ -258,7 +258,7 @@ impl OnColumn for ColsPrint {
         } else {
             rv
         };
-        eprintln!("on_col: 0x{:0x}, {}, {}, {}, {}", self.cur_type, row, col, v, rowid);
+        eprintln!("on_col: 0x{:0x}, {}, row: {}, col: {}, rowid: {}", self.cur_type, row, col, v, rowid);
         // [3,1,2]
         // [1,2,3]
         // stored: name, color
@@ -275,7 +275,7 @@ impl OnColumn for ColsPrint {
                 for cond in &self.conditions {
                     assert_eq!(cond.op, "=");
                     eprintln!(
-                        "col: {} - {} - {}, expected: {}",
+                        "col: cur-col: {} - want-col: {} - value: {}, expected: {}",
                         col.1,
                         cond.column,
                         v.to_string(),
