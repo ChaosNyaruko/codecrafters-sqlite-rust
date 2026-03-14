@@ -214,6 +214,7 @@ impl<'r> Tables<'r> {
         }
         eprintln!("create {:?}, indices:{:?}", t.columns, indices);
         let mut cp = ColsPrint {
+            with_id: t.columns[0].name == "id",
             col_indices: indices,
             per_row: vec!["".to_string(); len],
             filtered: false,
@@ -242,6 +243,7 @@ impl OnColumn for MockCol {
 }
 
 struct ColsPrint {
+    with_id: bool,
     col_indices: Vec<(usize, String)>,
     per_row: Vec<String>,
     filtered: bool,
@@ -254,7 +256,6 @@ impl OnColumn for ColsPrint {
         let v = if let ColType::Null = rv {
             &ColType::Integer(rowid)
         } else {
-            col += 1;
             rv
         };
         eprintln!("on_col: 0x{:0x}, {}, {}, {}, {}", self.cur_type, row, col, v, rowid);
