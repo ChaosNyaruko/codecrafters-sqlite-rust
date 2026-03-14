@@ -129,7 +129,11 @@ pub fn parse_create(sql: &str) -> Result<CreateTableStmt, String> {
     let table = caps.name("table").unwrap().as_str().to_string();
     let body = caps.name("body").unwrap().as_str();
 
-    let mut columns = Vec::new();
+    let mut columns = vec![ColumnDef {
+        name: "id".to_string(),
+        ty: None,
+    }];
+    // let mut columns = Vec::new();
 
     for chunk in body.split(',') {
         let chunk = chunk.trim();
@@ -142,6 +146,9 @@ pub fn parse_create(sql: &str) -> Result<CreateTableStmt, String> {
             .ok_or_else(|| format!("Invalid column definition: {chunk}"))?;
 
         let name = c.name("name").unwrap().as_str().to_string();
+        if name == "id" {
+            continue;
+        }
         let ty = c.name("ty").map(|m| m.as_str().to_string());
 
         columns.push(ColumnDef { name, ty });
