@@ -267,13 +267,13 @@ impl OnColumn for ColsPrint {
             {
                 for cond in &self.conditions {
                     assert_eq!(cond.op, "=");
-                    eprintln!(
-                        "col: {} - {} - {}, expected: {}",
-                        col.1,
-                        cond.column,
-                        v.to_string(),
-                        cond.value,
-                    );
+                    // eprintln!(
+                    //     "col: {} - {} - {}, expected: {}",
+                    //     col.1,
+                    //     cond.column,
+                    //     v.to_string(),
+                    //     cond.value,
+                    // );
                     if col.1 == cond.column && v.to_string() != cond.value {
                         self.filtered = true;
                         break;
