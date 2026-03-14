@@ -60,7 +60,8 @@ impl<'r> OnColumn for Tables<'r> {
         assert!(
             self.cur_create.table.contains(&self.cur_tbl_name),
             "create table name should be consistent with the tbl_name field, {} vs {}",
-            self.cur_create.table, self.cur_tbl_name,
+            self.cur_create.table,
+            self.cur_tbl_name,
         );
         self.content
             .insert(self.cur_tbl_name.clone(), self.cur_create.clone());
@@ -485,15 +486,16 @@ fn col_value(serial_type: i64, buf: &[u8], start: usize) -> ColType {
     match serial_type {
         0 => ColType::Null,
         1 => ColType::Integer(buf[start] as i64),
-        2 => ColType::Integer(i64::from_be_bytes(
-            buf[start..start + 2].try_into().unwrap(),
-        )),
-        3 => ColType::Integer(i64::from_be_bytes(
-            buf[start..start + 3].try_into().unwrap(),
-        )),
-        4 => ColType::Integer(i64::from_be_bytes(
-            buf[start..start + 4].try_into().unwrap(),
-        )),
+        2 => ColType::Integer(((buf[start] as i64) << 8) + buf[start + 1] as i64),
+        3 => ColType::Integer(
+            ((buf[start] as i64) << 16) + ((buf[start + 1] as i64) << 8) + buf[start + 2] as i64,
+        ),
+        4 => ColType::Integer(
+            ((buf[start] as i64) << 24)
+                + ((buf[start + 1] as i64) << 16)
+                + ((buf[start + 2] as i64) << 8)
+                + buf[start + 3] as i64,
+        ),
         5 => ColType::Integer(i64::from_be_bytes(
             buf[start..start + 6].try_into().unwrap(),
         )),
