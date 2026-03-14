@@ -252,7 +252,7 @@ struct ColsPrint {
 }
 
 impl OnColumn for ColsPrint {
-    fn on_col(&mut self, row: usize, mut col: usize, rv: &ColType, rowid: i64) {
+    fn on_col(&mut self, row: usize, col: usize, rv: &ColType, rowid: i64) {
         let v = if let ColType::Null = rv {
             &ColType::Integer(rowid)
         } else {
@@ -275,7 +275,8 @@ impl OnColumn for ColsPrint {
                 for cond in &self.conditions {
                     assert_eq!(cond.op, "=");
                     eprintln!(
-                        "col: cur-col: {} - want-col: {} - value: {}, expected: {}",
+                        "col_indices: {:?}, col: cur-col: {} - want-col: {} - value: {}, expected: {}",
+                        self.col_indices,
                         col.1,
                         cond.column,
                         v.to_string(),
