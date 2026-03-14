@@ -212,7 +212,7 @@ impl<'r> Tables<'r> {
                 ))?;
             indices.push((col_index.0, col_name));
         }
-        // eprintln!("create {:?}, indices:{:?}", t.columns, indices);
+        eprintln!("create {:?}, indices:{:?}", t.columns, indices);
         let mut cp = ColsPrint {
             col_indices: indices,
             per_row: vec!["".to_string(); len],
