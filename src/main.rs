@@ -250,7 +250,13 @@ struct ColsPrint {
 }
 
 impl OnColumn for ColsPrint {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
+    fn on_col(&mut self, row: usize, mut col: usize, rv: &ColType, rowid: i64) {
+        let v = if let ColType::Null = rv {
+            &ColType::Integer(rowid)
+        } else {
+            col += 1;
+            rv
+        };
         eprintln!("on_col: 0x{:0x}, {}, {}, {}, {}", self.cur_type, row, col, v, rowid);
         // [3,1,2]
         // [1,2,3]
@@ -263,17 +269,17 @@ impl OnColumn for ColsPrint {
                 .col_indices
                 .iter()
                 .enumerate()
-                .find(|c| (*c.1).0 == col + 1)
+                .find(|c| (*c.1).0 == col)
             {
                 for cond in &self.conditions {
                     assert_eq!(cond.op, "=");
-                    // eprintln!(
-                    //     "col: {} - {} - {}, expected: {}",
-                    //     col.1,
-                    //     cond.column,
-                    //     v.to_string(),
-                    //     cond.value,
-                    // );
+                    eprintln!(
+                        "col: {} - {} - {}, expected: {}",
+                        col.1,
+                        cond.column,
+                        v.to_string(),
+                        cond.value,
+                    );
                     if col.1 == cond.column && v.to_string() != cond.value {
                         self.filtered = true;
                         break;
