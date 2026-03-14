@@ -121,7 +121,13 @@ impl<'r> Tables<'r> {
         return Some(res);
     }
 
-    fn select(&self, table: &String, cols: Vec<String>) -> Result<()> {
+    fn select(
+        &self,
+        table: &String,
+        cols: Vec<String>,
+        conditions: Vec<parser::Condition>,
+    ) -> Result<()> {
+        // eprintln!("conds: {:?}", conditions);
         let t = self
             .content
             .get(table)
@@ -136,19 +142,24 @@ impl<'r> Tables<'r> {
         ));
         let mut indices = Vec::new();
         let len = cols.len();
-        for col in cols {
+        for col_name in cols {
             let col_index = t
                 .columns
                 .iter()
                 .enumerate()
-                .find(|c| c.1.name == col)
-                .context(format!("cannot find column {} for table: {}", col, table))?;
-            indices.push(col_index.0);
+                .find(|c| c.1.name == col_name)
+                .context(format!(
+                    "cannot find column {} for table: {}",
+                    col_name, table
+                ))?;
+            indices.push((col_index.0, col_name));
         }
         // eprintln!("create {:?}, indices:{:?}", t.columns, indices);
         let mut cp = ColsPrint {
             col_indices: indices,
-            per_row: vec!["".to_string() ; len],
+            per_row: vec!["".to_string(); len],
+            filtered: false,
+            conditions: conditions,
         };
         parse_cell_as_rows(&p, &mut cp);
 
@@ -157,8 +168,10 @@ impl<'r> Tables<'r> {
 }
 
 struct ColsPrint {
-    col_indices: Vec<usize>,
+    col_indices: Vec<(usize, String)>,
     per_row: Vec<String>,
+    filtered: bool,
+    conditions: Vec<parser::Condition>,
 }
 
 impl OnColumn for ColsPrint {
@@ -166,14 +179,34 @@ impl OnColumn for ColsPrint {
         // eprintln!("{row}, {col}, {v}");
         // [3,1,2]
         // [1,2,3]
-        if let Some(i) = self.col_indices.iter().enumerate().find(|c| *c.1 == col) {
-            self.per_row[i.0] = v.to_string();
+        // stored: name, color
+        // select: color name
+        // select name from xxx where color = 'Yellow';
+        // TODO: We only support AND for now.
+        if let Some((i, col)) = self
+            .col_indices
+            .iter()
+            .enumerate()
+            .find(|c| (*c.1).0 == col)
+        {
+            for cond in &self.conditions {
+                assert_eq!(cond.op, "=");
+                // eprintln!("col: {}, expected: {}", col.1, v.to_string());
+                if col.1 == cond.column && v.to_string() != cond.value {
+                    self.filtered = true;
+                    break;
+                }
+            }
+            self.per_row[i] = v.to_string();
         }
     }
 
     fn on_row(&mut self) {
-        println!("{}", self.per_row.join("|"));
+        if !self.filtered {
+            println!("{}", self.per_row.join("|"));
+        }
         self.per_row.resize(self.per_row.len(), "".to_string());
+        self.filtered = false;
     }
 
     fn finalize(&mut self) {}
@@ -295,13 +328,14 @@ fn main() -> Result<()> {
             let db = parse_dbinfo(&mut file)?;
             let p = parse_page(0, &mut file, &db)?;
             let t = Tables::new(&db, &p, &mut file).expect("not getting legal tables");
-            t.select(&table, select.columns).unwrap_or_else(|_| {
-                let root = t.pos.get(&table).expect(&format!("{} not exists", table));
-                let p = parse_page(*root - 1, &mut file, &db)
-                    .context("parse page err")
-                    .unwrap();
-                println!("{}", p.cell_num);
-            });
+            t.select(&table, select.columns, select.conditions)
+                .unwrap_or_else(|_| {
+                    let root = t.pos.get(&table).expect(&format!("{} not exists", table));
+                    let p = parse_page(*root - 1, &mut file, &db)
+                        .context("parse page err")
+                        .unwrap();
+                    println!("{}", p.cell_num);
+                });
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
