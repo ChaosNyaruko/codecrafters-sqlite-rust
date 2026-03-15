@@ -214,8 +214,8 @@ impl<'r> Tables<'r> {
         }
         eprintln!("create {:?}, indices:{:?}", t.columns, indices);
         let mut cp = ColsPrint {
-            with_id: t.columns[0].name == "id",
-            col_indices: indices,
+            select_indices: indices,
+            schema: t.columns.clone(),
             per_row: vec!["".to_string(); len],
             filtered: false,
             conditions: conditions,
@@ -243,8 +243,8 @@ impl OnColumn for MockCol {
 }
 
 struct ColsPrint {
-    with_id: bool,
-    col_indices: Vec<(usize, String)>,
+    select_indices: Vec<(usize, String)>,
+    schema: Vec<parser::ColumnDef>,
     per_row: Vec<String>,
     filtered: bool,
     conditions: Vec<parser::Condition>,
@@ -258,7 +258,10 @@ impl OnColumn for ColsPrint {
         } else {
             rv
         };
-        eprintln!("on_col: 0x{:0x}, {}, row: {}, col: {}, rowid: {}", self.cur_type, row, col, v, rowid);
+        eprintln!(
+            "on_col: 0x{:0x}, {}, row: {}, col: {}, rowid: {}",
+            self.cur_type, row, col, v, rowid
+        );
         // [3,1,2]
         // [1,2,3]
         // stored: name, color
@@ -266,27 +269,29 @@ impl OnColumn for ColsPrint {
         // select name from xxx where color = 'Yellow';
         // TODO: We only support AND for now.
         if self.cur_type == 0x0d {
+            for cond in &self.conditions {
+                assert_eq!(cond.op, "=");
+                let c = self
+                    .schema
+                    .iter()
+                    .enumerate()
+                    .find(|c| c.1.name == cond.column)
+                    .expect(&format!("cannot find the condtion {}", cond.column));
+                if c.0 != col {
+                    continue;
+                }
+                eprintln!("{} vs {}: {} vs {}", cond.column, c.1.name, cond.value, v.to_string());
+                if v.to_string() != cond.value {
+                    self.filtered = true;
+                    break;
+                }
+            }
             if let Some((i, col)) = self
-                .col_indices
+                .select_indices
                 .iter()
                 .enumerate()
                 .find(|c| (*c.1).0 == col)
             {
-                for cond in &self.conditions {
-                    assert_eq!(cond.op, "=");
-                    eprintln!(
-                        "col_indices: {:?}, col: cur-col: {} - want-col: {} - value: {}, expected: {}",
-                        self.col_indices,
-                        col.1,
-                        cond.column,
-                        v.to_string(),
-                        cond.value,
-                    );
-                    if col.1 == cond.column && v.to_string() != cond.value {
-                        self.filtered = true;
-                        break;
-                    }
-                }
                 self.per_row[i] = v.to_string();
             }
         }
