@@ -77,5 +77,7 @@ directly from
 [codecrafters-io/sample-sqlite-databases](https://github.com/codecrafters-io/sample-sqlite-databases).
 
 # My Notes
-- If you are confuse about the "rowid" and "id" stuff, it it not by design
-[](https://www.sqlite.org/lang_createtable.html#rowid)
+- If you are confuse about the "rowid" and "id" stuff, [it is not by design] (https://www.sqlite.org/lang_createtable.html#rowid)
+- btree order: https://www.sqlite.org/fileformat.html#b_tree_pages
+> For any key X, pointers to the left of a X refer to b-tree pages on which all keys are less than or equal to X. Pointers to the right of X refer to pages where all keys are greater than X.
+- https://saveriomiroddi.github.io/SQLIte-database-file-format-diagrams/

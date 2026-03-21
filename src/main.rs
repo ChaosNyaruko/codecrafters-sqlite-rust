@@ -19,13 +19,17 @@ struct Tables<'r> {
 
     // state
     cur_tbl_name: String,
+    cur_name: String,
     cur_rootpage: usize,
     cur_create: Create,
     create_type: String,
 
     display: String,
-    pos: HashMap<String, usize>,      // key: tbl_name, value: rootpage
-    content: HashMap<String, Create>, // key: tbl_name, value: Table with column names
+    pos: HashMap<String, usize>,      // key: name, value: rootpage
+    content: HashMap<String, Create>, // key: name, value: Table with column names
+    // TODO: we only support one index per table
+    indexes: HashMap<String, (String, String)>, // key: tbl_name,
+                                                // value: (col_name,  index_name/name)
 }
 
 trait OnColumn {
@@ -40,6 +44,9 @@ impl<'r> OnColumn for Tables<'r> {
         // schema: type name tbl_name rootpage sql
         if col == 0 {
             self.create_type = v.to_string()
+        }
+        if col == 1 {
+            self.cur_name = v.to_string()
         }
         if col == 2 {
             if let ColType::Text(text) = v {
@@ -57,12 +64,16 @@ impl<'r> OnColumn for Tables<'r> {
         }
         if col == 4 {
             if let ColType::Text(sql) = v {
-                // eprintln!("sql:{}", sql);
+                eprintln!("sql:{}", sql);
                 let cols = if self.create_type == "index" {
-                    Create::Index(
-                        parser::parse_create_index(&sql)
-                            .expect(&format!("parse create table err: {sql}")),
-                    )
+                    let c = parser::parse_create_index(&sql)
+                        .expect(&format!("parse create table err: {sql}"));
+                    assert_eq!(
+                        c.columns.len(),
+                        1,
+                        "we only support single column index for now."
+                    );
+                    Create::Index(c)
                 } else {
                     Create::Table(
                         parser::parse_create(&sql)
@@ -75,10 +86,24 @@ impl<'r> OnColumn for Tables<'r> {
     }
 
     fn on_row(&mut self) {
-        self.pos
-            .insert(self.cur_tbl_name.clone(), self.cur_rootpage);
+        eprintln!(
+            "cur_name:{}, cur_create:{:?}",
+            self.cur_name, self.cur_create
+        );
+        self.pos.insert(self.cur_name.clone(), self.cur_rootpage);
         self.content
-            .insert(self.cur_tbl_name.clone(), self.cur_create.clone());
+            .insert(self.cur_name.clone(), self.cur_create.clone());
+        if self.create_type == "index" {
+            let i = match &self.cur_create {
+                Create::Index(i) => i,
+                _ => unreachable!(),
+            };
+            assert_eq!(self.cur_tbl_name, i.table);
+            self.indexes.insert(
+                self.cur_tbl_name.clone(),
+                (i.columns[0].clone(), i.name.clone()),
+            );
+        }
     }
 
     fn finalize(&mut self) {}
@@ -163,12 +188,143 @@ fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBI
             i += j;
             parse_cell_as_rows(&left_page, state, reader, db);
             // eprintln!("0x05 interior key/rowid: {rowid}");
+        } else if p.page_type == 0x02 {
+            let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
+            i += 4;
+            let (size, j1) = decode_varint(buf);
+            i += j1;
+
+            let U = db.page_size as usize;
+            let X = ((U - 12) * 64 / 255) - 23;
+            let M = ((U - 12) * 32 / 255) - 23;
+            let P = size as usize;
+            let K = M + ((P - M) % (U - 4));
+            let mut onpage;
+            if P <= X {
+                // no overflow
+            } else if K <= X {
+                // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
+                onpage = buf[i..i + K].to_vec();
+                let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
+                while next != 0 {
+                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                    onpage.extend(&op.page[4..]);
+                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+                }
+                buf = &onpage;
+                i = 0;
+            } else if K > X {
+                // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
+                onpage = buf[i..i + M].to_vec();
+                let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
+                while next != 0 {
+                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                    onpage.extend(&op.page[4..]);
+                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+                }
+                buf = &onpage;
+                i = 0;
+            } else {
+                unreachable!();
+            }
+
+            // payload
+            // decode record header
+            let (header_size, j) = decode_varint(&buf[i..]);
+            i += j;
+            let mut serial_size = header_size as usize - j;
+            let mut serials = Vec::new();
+            while serial_size > 0 {
+                let (serial_type, j) = decode_varint(&buf[i..]);
+                i += j;
+                serial_size -= j;
+                serials.push(serial_type);
+            }
+            assert_eq!(serial_size, 0);
+
+            // decode record body
+            for (f, t) in serials.into_iter().enumerate() {
+                let size = serial_type_size(t);
+                let v = col_value(t, buf, i);
+                // for single column index:
+                // 0: key value
+                // 1: rowid
+                eprintln!("page type 0x02: {f}, value: {v}");
+                i += size;
+                state.on_col(ic, f, &v, -1);
+            }
+            state.on_row();
+            let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
+            parse_cell_as_rows(&left_page, state, reader, db);
+        } else if p.page_type == 0x0a {
+            // payload size
+            let (size, j1) = decode_varint(buf);
+            i += j1;
+
+            // payload body with overflow pages
+            let U = db.page_size as usize;
+            let X = ((U - 12) * 64 / 255) - 23;
+            let M = ((U - 12) * 32 / 255) - 23;
+            let P = size as usize;
+            let K = M + ((P - M) % (U - 4));
+            let mut onpage;
+            if P <= X {
+                // no overflow
+            } else if K <= X {
+                // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
+                onpage = buf[i..i + K].to_vec();
+                let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
+                while next != 0 {
+                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                    onpage.extend(&op.page[4..]);
+                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+                }
+                buf = &onpage;
+                i = 0;
+            } else if K > X {
+                // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
+                onpage = buf[i..i + M].to_vec();
+                let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
+                while next != 0 {
+                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                    onpage.extend(&op.page[4..]);
+                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+                }
+                buf = &onpage;
+                i = 0;
+            } else {
+                unreachable!();
+            }
+
+            // payload
+            // decode record header
+            let (header_size, j) = decode_varint(&buf[i..]);
+            i += j;
+            let mut serial_size = header_size as usize - j;
+            let mut serials = Vec::new();
+            while serial_size > 0 {
+                let (serial_type, j) = decode_varint(&buf[i..]);
+                i += j;
+                serial_size -= j;
+                serials.push(serial_type);
+            }
+            assert_eq!(serial_size, 0);
+
+            // decode record body
+            for (f, t) in serials.into_iter().enumerate() {
+                let size = serial_type_size(t);
+                let v = col_value(t, buf, i);
+                eprintln!("page_type: 0x0a: {f}, value:{v}");
+                i += size;
+                state.on_col(ic, f, &v, -1);
+            }
+            state.on_row();
         } else {
-            unimplemented!("parse cell for {}", p.page_type);
+            unreachable!("parse cell for {}", p.page_type);
         }
     }
 
-    if p.page_type == 0x05 {
+    if p.page_type == 0x05 || p.page_type == 0x02 {
         let right_page = parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
         parse_cell_as_rows(&right_page, state, reader, db);
     }
@@ -184,14 +340,44 @@ impl<'r> Tables<'r> {
             pos: HashMap::new(),
             content: HashMap::new(),
             cur_tbl_name: String::new(),
+            cur_name: String::new(),
             cur_rootpage: 0,
             cur_create: Create::Null,
             create_type: "table".to_string(),
+            indexes: HashMap::new(),
         };
 
         parse_cell_as_rows(p, &mut res, reader, *db);
         // eprintln!("table: {:?}", res);
         return Some(res);
+    }
+
+    fn select_by_index(
+        &self,
+        index_name: &String,
+        conditions: Vec<parser::Condition>,
+    ) -> Result<Vec<i64>, ()> {
+        let index = self
+            .content
+            .get(index_name)
+            .expect(&format!("cannot find table: {index_name}"));
+        let index_rootpage = self
+            .pos
+            .get(index_name)
+            .expect(&format!("cannot find table: {index_name}"));
+        let p = parse_page(index_rootpage - 1, self.reader, &self.dbinfo, false).expect(&format!(
+            "cannot parse page {} for table: {}",
+            index_rootpage, index_name
+        ));
+        let t = match index {
+            Create::Index(c) => c,
+            _ => unimplemented!(),
+        };
+        let mut cp = IndexCol {
+            conditions: conditions,
+        };
+        parse_cell_as_rows(&p, &mut cp, self.reader, self.dbinfo);
+        Ok(Vec::new())
     }
 
     fn select(
@@ -201,7 +387,7 @@ impl<'r> Tables<'r> {
         conditions: Vec<parser::Condition>,
     ) -> Result<()> {
         eprintln!("conds: {:?}", conditions);
-        let t = self
+        let tables = self
             .content
             .get(table)
             .expect(&format!("cannot find table: {table}"));
@@ -213,7 +399,7 @@ impl<'r> Tables<'r> {
             "cannot parse page {} for table: {}",
             rootpage, table
         ));
-        let t = match t {
+        let t = match tables {
             Create::Table(c) => c,
             _ => unimplemented!(),
         };
@@ -248,6 +434,24 @@ impl<'r> Tables<'r> {
 
 struct MockCol;
 impl OnColumn for MockCol {
+    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
+        eprintln!("on_col {row}, {col}, {v}");
+    }
+
+    fn on_row(&mut self) {
+        eprintln!("on_row");
+    }
+
+    fn finalize(&mut self) {}
+
+    fn set_type(&mut self, t: u8) {}
+}
+
+struct IndexCol {
+    conditions: Vec<parser::Condition>,
+}
+
+impl OnColumn for IndexCol {
     fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
         eprintln!("on_col {row}, {col}, {v}");
     }
@@ -417,8 +621,8 @@ fn parse_page<'r>(
 
     let page_type = page_header[0];
     assert!(
-        page_type == 0x0d || page_type == 0x05,
-        "we only support leaf page now, but got {page_type}"
+        page_type == 0x0d || page_type == 0x05 || page_type == 0x02 || page_type == 0x0a,
+        "invalid page_type {page_type}"
     );
     let is_leaf = page_type == 0x0d || page_type == 0x0a;
     let freeblock_start = u16::from_be_bytes(page_header[1..3].try_into().unwrap());
@@ -481,10 +685,25 @@ fn main() -> Result<()> {
             let table = select.table;
             let db = parse_dbinfo(&mut file)?;
             let p = parse_page(0, &mut file, &db, false)?;
-            let t = Tables::new(&db, &p, &mut file).expect("not getting legal tables");
-            t.select(&table, select.columns, select.conditions)
+            let tables = Tables::new(&db, &p, &mut file).expect("not getting legal tables");
+            assert_eq!(select.conditions.len(), 1, "{:?}", select.columns);
+            eprintln!(
+                "indexes: {:?}, pos: {:?}, content: {:?}, table: {}",
+                tables.indexes, tables.pos, tables.content, table
+            );
+            if let Some(c) = tables.indexes.get(&table) {
+                let v = tables
+                    .select_by_index(&c.1, select.conditions)
+                    .expect("select by index error");
+            }
+            todo!("parse index page complete, search next");
+            tables
+                .select(&table, select.columns, select.conditions)
                 .unwrap_or_else(|_| {
-                    let root = t.pos.get(&table).expect(&format!("{} not exists", table));
+                    let root = tables
+                        .pos
+                        .get(&table)
+                        .expect(&format!("{} not exists", table));
                     let p = parse_page(*root - 1, &mut file, &db, false)
                         .context("parse page err")
                         .unwrap();
