@@ -5,6 +5,13 @@ use std::fs::File;
 use std::io::{SeekFrom, prelude::*};
 mod parser;
 
+#[derive(Debug, Clone)]
+enum Create {
+    Table(parser::CreateTableStmt),
+    Index(parser::CreateIndexStmt),
+    Null,
+}
+
 #[derive(Debug)]
 struct Tables<'r> {
     dbinfo: DBInfo,
@@ -13,11 +20,12 @@ struct Tables<'r> {
     // state
     cur_tbl_name: String,
     cur_rootpage: usize,
-    cur_create: parser::CreateTableStmt,
+    cur_create: Create,
+    create_type: String,
 
     display: String,
-    pos: HashMap<String, usize>, // key: tbl_name, value: rootpage
-    content: HashMap<String, parser::CreateTableStmt>, // key: tbl_name, value: Table with column names
+    pos: HashMap<String, usize>,      // key: tbl_name, value: rootpage
+    content: HashMap<String, Create>, // key: tbl_name, value: Table with column names
 }
 
 trait OnColumn {
@@ -30,6 +38,9 @@ trait OnColumn {
 impl<'r> OnColumn for Tables<'r> {
     fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
         // schema: type name tbl_name rootpage sql
+        if col == 0 {
+            self.create_type = v.to_string()
+        }
         if col == 2 {
             if let ColType::Text(text) = v {
                 write!(self.display, "{}", text).unwrap();
@@ -47,8 +58,17 @@ impl<'r> OnColumn for Tables<'r> {
         if col == 4 {
             if let ColType::Text(sql) = v {
                 // eprintln!("sql:{}", sql);
-                let cols = parser::parse_create(&sql).expect(&format!("parse create err: {sql}"));
-                // eprintln!("create: {cols:?}");
+                let cols = if self.create_type == "index" {
+                    Create::Index(
+                        parser::parse_create_index(&sql)
+                            .expect(&format!("parse create table err: {sql}")),
+                    )
+                } else {
+                    Create::Table(
+                        parser::parse_create(&sql)
+                            .expect(&format!("parse create table err: {sql}")),
+                    )
+                };
                 self.cur_create = cols;
             }
         }
@@ -57,12 +77,6 @@ impl<'r> OnColumn for Tables<'r> {
     fn on_row(&mut self) {
         self.pos
             .insert(self.cur_tbl_name.clone(), self.cur_rootpage);
-        assert!(
-            self.cur_create.table.contains(&self.cur_tbl_name),
-            "create table name should be consistent with the tbl_name field, {} vs {}",
-            self.cur_create.table,
-            self.cur_tbl_name,
-        );
         self.content
             .insert(self.cur_tbl_name.clone(), self.cur_create.clone());
     }
@@ -171,7 +185,8 @@ impl<'r> Tables<'r> {
             content: HashMap::new(),
             cur_tbl_name: String::new(),
             cur_rootpage: 0,
-            cur_create: Default::default(),
+            cur_create: Create::Null,
+            create_type: "table".to_string(),
         };
 
         parse_cell_as_rows(p, &mut res, reader, *db);
@@ -198,6 +213,10 @@ impl<'r> Tables<'r> {
             "cannot parse page {} for table: {}",
             rootpage, table
         ));
+        let t = match t {
+            Create::Table(c) => c,
+            _ => unimplemented!(),
+        };
         let mut indices = Vec::new();
         let len = cols.len();
         for col_name in cols {
@@ -280,7 +299,13 @@ impl OnColumn for ColsPrint {
                 if c.0 != col {
                     continue;
                 }
-                eprintln!("{} vs {}: {} vs {}", cond.column, c.1.name, cond.value, v.to_string());
+                eprintln!(
+                    "{} vs {}: {} vs {}",
+                    cond.column,
+                    c.1.name,
+                    cond.value,
+                    v.to_string()
+                );
                 if v.to_string() != cond.value {
                     self.filtered = true;
                     break;
