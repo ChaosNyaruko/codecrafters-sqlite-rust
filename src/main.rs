@@ -111,6 +111,30 @@ impl<'r> OnColumn for Tables<'r> {
     fn set_type(&mut self, _t: u8) {}
 }
 
+fn scan_btree(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBInfo) {
+    state.set_type(p.page_type);
+    let cell_offsets = &p.cell_offsets;
+
+    // preorder traversal
+    for (ic, offset) in cell_offsets.into_iter().enumerate() {
+        let (key, left) = parse_one_cell(ic, *offset, p, state, reader, db);
+        if left > 0 {
+            assert!(p.page_type == 0x02 || p.page_type == 0x05);
+            // only for interior nodes
+            let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
+            scan_btree(&left_page, state, reader, db);
+        }
+    }
+
+    if p.page_type == 0x05 || p.page_type == 0x02 {
+        let right_page = parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
+        scan_btree(&right_page, state, reader, db);
+    }
+    state.finalize();
+}
+
+// -> key/rowid
+// -> the left_pointer
 fn parse_one_cell(
     ic: usize,
     offset: u16,
@@ -118,7 +142,7 @@ fn parse_one_cell(
     state: &mut dyn OnColumn,
     reader: &File,
     db: DBInfo,
-) {
+) -> (ColType, usize) {
     let page = &p.page;
     let mut buf = &page[offset as usize..];
     let mut i = 0;
@@ -184,14 +208,13 @@ fn parse_one_cell(
             state.on_col(ic, f, &v, rowid);
         }
         state.on_row();
+        return (ColType::Null, 0);
     } else if p.page_type == 0x05 {
         let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
         i += 4;
-        let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
         let (rowid, j) = decode_varint(&buf[i..]);
         i += j;
-        parse_cell_as_rows(&left_page, state, reader, db);
-        // eprintln!("0x05 interior key/rowid: {rowid}");
+        return (ColType::Integer(rowid), left as usize);
     } else if p.page_type == 0x02 {
         let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
         i += 4;
@@ -246,20 +269,24 @@ fn parse_one_cell(
         }
         assert_eq!(serial_size, 0);
 
+        let mut res = ColType::Null;
         // decode record body
         for (f, t) in serials.into_iter().enumerate() {
             let size = serial_type_size(t);
             let v = col_value(t, buf, i);
-            // for single column index:
-            // 0: key value
-            // 1: rowid
             eprintln!("page type 0x02: {f}, value: {v}");
+            if f == 0 {
+                // for single column index:
+                // 0: key value
+                // 1: rowid
+                // we don't support multi column index for now
+                res = v.clone();
+            }
             i += size;
             state.on_col(ic, f, &v, -1);
         }
         state.on_row();
-        let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
-        parse_cell_as_rows(&left_page, state, reader, db);
+        return (res, left as usize);
     } else if p.page_type == 0x0a {
         // payload size
         let (size, j1) = decode_varint(buf);
@@ -314,15 +341,20 @@ fn parse_one_cell(
         }
         assert_eq!(serial_size, 0);
 
+        let mut res = ColType::Null;
         // decode record body
         for (f, t) in serials.into_iter().enumerate() {
             let size = serial_type_size(t);
             let v = col_value(t, buf, i);
             eprintln!("page_type: 0x0a: {f}, value:{v}");
+            if f == 0 {
+                res = v.clone();
+            }
             i += size;
             state.on_col(ic, f, &v, -1);
         }
         state.on_row();
+        return (res, 0);
     } else {
         unreachable!("parse cell for {}", p.page_type);
     }
@@ -333,11 +365,6 @@ fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBI
     let cell_offsets = &p.cell_offsets;
     for (ic, offset) in cell_offsets.into_iter().enumerate() {
         parse_one_cell(ic, *offset, p, state, reader, db);
-    }
-
-    if p.page_type == 0x05 || p.page_type == 0x02 {
-        let right_page = parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
-        parse_cell_as_rows(&right_page, state, reader, db);
     }
     state.finalize();
 }
@@ -387,7 +414,7 @@ impl<'r> Tables<'r> {
         let mut cp = IndexCol {
             conditions: conditions,
         };
-        parse_cell_as_rows(&p, &mut cp, self.reader, self.dbinfo);
+        scan_btree(&p, &mut cp, self.reader, self.dbinfo);
         Ok(Vec::new())
     }
 
@@ -437,7 +464,7 @@ impl<'r> Tables<'r> {
             conditions: conditions,
             cur_type: 0,
         };
-        parse_cell_as_rows(&p, &mut cp, self.reader, self.dbinfo);
+        scan_btree(&p, &mut cp, self.reader, self.dbinfo);
 
         Ok(())
     }
@@ -697,7 +724,11 @@ fn main() -> Result<()> {
             let db = parse_dbinfo(&mut file)?;
             let p = parse_page(0, &mut file, &db, false)?;
             let tables = Tables::new(&db, &p, &mut file).expect("not getting legal tables");
-            assert_eq!(select.conditions.len(), 1, "{:?}", select.columns);
+            // assert_eq!(select.columns.len(), 1, "{:?}", select.columns);
+            assert!(
+                select.conditions.len() <= 1,
+                "we only support single column index"
+            );
             eprintln!(
                 "indexes: {:?}, pos: {:?}, content: {:?}, table: {}",
                 tables.indexes, tables.pos, tables.content, table
@@ -727,7 +758,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ColType {
     Null,
     Integer(i64),
