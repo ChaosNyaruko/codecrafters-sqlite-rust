@@ -111,217 +111,228 @@ impl<'r> OnColumn for Tables<'r> {
     fn set_type(&mut self, _t: u8) {}
 }
 
-fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBInfo) {
+fn parse_one_cell(
+    ic: usize,
+    offset: u16,
+    p: &Page,
+    state: &mut dyn OnColumn,
+    reader: &File,
+    db: DBInfo,
+) {
     let page = &p.page;
+    let mut buf = &page[offset as usize..];
+    let mut i = 0;
+    if p.page_type == 0x0d {
+        let (size, j1) = decode_varint(buf);
+        i += j1;
+        let (rowid, j2) = decode_varint(&buf[i..]);
+        i += j2;
+
+        let U = db.page_size as usize;
+        let X = U - 35;
+        let M = ((U - 12) * 32 / 255) - 23;
+        let P = size as usize;
+        let K = M + ((P - M) % (U - 4));
+        let mut onpage;
+        if P <= X {
+            // no overflow
+        } else if K <= X {
+            // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
+            onpage = buf[i..i + K].to_vec();
+            let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
+            while next != 0 {
+                let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                onpage.extend(&op.page[4..]);
+                next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+            }
+            buf = &onpage;
+            i = 0;
+        } else if K > X {
+            // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
+            onpage = buf[i..i + M].to_vec();
+            let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
+            while next != 0 {
+                let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                onpage.extend(&op.page[4..]);
+                next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+            }
+            buf = &onpage;
+            i = 0;
+        } else {
+            unreachable!();
+        }
+
+        // payload
+        // decode record header
+        let (header_size, j) = decode_varint(&buf[i..]);
+        i += j;
+        let mut serial_size = header_size as usize - j;
+        let mut serials = Vec::new();
+        while serial_size > 0 {
+            let (serial_type, j) = decode_varint(&buf[i..]);
+            i += j;
+            serial_size -= j;
+            serials.push(serial_type);
+        }
+        assert_eq!(serial_size, 0);
+
+        // decode record body
+        for (f, t) in serials.into_iter().enumerate() {
+            let size = serial_type_size(t);
+            let v = col_value(t, buf, i);
+            i += size;
+            state.on_col(ic, f, &v, rowid);
+        }
+        state.on_row();
+    } else if p.page_type == 0x05 {
+        let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
+        i += 4;
+        let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
+        let (rowid, j) = decode_varint(&buf[i..]);
+        i += j;
+        parse_cell_as_rows(&left_page, state, reader, db);
+        // eprintln!("0x05 interior key/rowid: {rowid}");
+    } else if p.page_type == 0x02 {
+        let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
+        i += 4;
+        let (size, j1) = decode_varint(buf);
+        i += j1;
+
+        let U = db.page_size as usize;
+        let X = ((U - 12) * 64 / 255) - 23;
+        let M = ((U - 12) * 32 / 255) - 23;
+        let P = size as usize;
+        let K = M + ((P - M) % (U - 4));
+        let mut onpage;
+        if P <= X {
+            // no overflow
+        } else if K <= X {
+            // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
+            onpage = buf[i..i + K].to_vec();
+            let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
+            while next != 0 {
+                let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                onpage.extend(&op.page[4..]);
+                next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+            }
+            buf = &onpage;
+            i = 0;
+        } else if K > X {
+            // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
+            onpage = buf[i..i + M].to_vec();
+            let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
+            while next != 0 {
+                let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                onpage.extend(&op.page[4..]);
+                next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+            }
+            buf = &onpage;
+            i = 0;
+        } else {
+            unreachable!();
+        }
+
+        // payload
+        // decode record header
+        let (header_size, j) = decode_varint(&buf[i..]);
+        i += j;
+        let mut serial_size = header_size as usize - j;
+        let mut serials = Vec::new();
+        while serial_size > 0 {
+            let (serial_type, j) = decode_varint(&buf[i..]);
+            i += j;
+            serial_size -= j;
+            serials.push(serial_type);
+        }
+        assert_eq!(serial_size, 0);
+
+        // decode record body
+        for (f, t) in serials.into_iter().enumerate() {
+            let size = serial_type_size(t);
+            let v = col_value(t, buf, i);
+            // for single column index:
+            // 0: key value
+            // 1: rowid
+            eprintln!("page type 0x02: {f}, value: {v}");
+            i += size;
+            state.on_col(ic, f, &v, -1);
+        }
+        state.on_row();
+        let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
+        parse_cell_as_rows(&left_page, state, reader, db);
+    } else if p.page_type == 0x0a {
+        // payload size
+        let (size, j1) = decode_varint(buf);
+        i += j1;
+
+        // payload body with overflow pages
+        let U = db.page_size as usize;
+        let X = ((U - 12) * 64 / 255) - 23;
+        let M = ((U - 12) * 32 / 255) - 23;
+        let P = size as usize;
+        let K = M + ((P - M) % (U - 4));
+        let mut onpage;
+        if P <= X {
+            // no overflow
+        } else if K <= X {
+            // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
+            onpage = buf[i..i + K].to_vec();
+            let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
+            while next != 0 {
+                let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                onpage.extend(&op.page[4..]);
+                next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+            }
+            buf = &onpage;
+            i = 0;
+        } else if K > X {
+            // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
+            onpage = buf[i..i + M].to_vec();
+            let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
+            while next != 0 {
+                let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
+                onpage.extend(&op.page[4..]);
+                next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
+            }
+            buf = &onpage;
+            i = 0;
+        } else {
+            unreachable!();
+        }
+
+        // payload
+        // decode record header
+        let (header_size, j) = decode_varint(&buf[i..]);
+        i += j;
+        let mut serial_size = header_size as usize - j;
+        let mut serials = Vec::new();
+        while serial_size > 0 {
+            let (serial_type, j) = decode_varint(&buf[i..]);
+            i += j;
+            serial_size -= j;
+            serials.push(serial_type);
+        }
+        assert_eq!(serial_size, 0);
+
+        // decode record body
+        for (f, t) in serials.into_iter().enumerate() {
+            let size = serial_type_size(t);
+            let v = col_value(t, buf, i);
+            eprintln!("page_type: 0x0a: {f}, value:{v}");
+            i += size;
+            state.on_col(ic, f, &v, -1);
+        }
+        state.on_row();
+    } else {
+        unreachable!("parse cell for {}", p.page_type);
+    }
+}
+
+fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBInfo) {
     state.set_type(p.page_type);
     let cell_offsets = &p.cell_offsets;
     for (ic, offset) in cell_offsets.into_iter().enumerate() {
-        let mut buf = &page[*offset as usize..];
-        let mut i = 0;
-        if p.page_type == 0x0d {
-            let (size, j1) = decode_varint(buf);
-            i += j1;
-            let (rowid, j2) = decode_varint(&buf[i..]);
-            i += j2;
-
-            let U = db.page_size as usize;
-            let X = U - 35;
-            let M = ((U - 12) * 32 / 255) - 23;
-            let P = size as usize;
-            let K = M + ((P - M) % (U - 4));
-            let mut onpage;
-            if P <= X {
-                // no overflow
-            } else if K <= X {
-                // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
-                onpage = buf[i..i + K].to_vec();
-                let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
-                while next != 0 {
-                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
-                    onpage.extend(&op.page[4..]);
-                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
-                }
-                buf = &onpage;
-                i = 0;
-            } else if K > X {
-                // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
-                onpage = buf[i..i + M].to_vec();
-                let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
-                while next != 0 {
-                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
-                    onpage.extend(&op.page[4..]);
-                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
-                }
-                buf = &onpage;
-                i = 0;
-            } else {
-                unreachable!();
-            }
-
-            // payload
-            // decode record header
-            let (header_size, j) = decode_varint(&buf[i..]);
-            i += j;
-            let mut serial_size = header_size as usize - j;
-            let mut serials = Vec::new();
-            while serial_size > 0 {
-                let (serial_type, j) = decode_varint(&buf[i..]);
-                i += j;
-                serial_size -= j;
-                serials.push(serial_type);
-            }
-            assert_eq!(serial_size, 0);
-
-            // decode record body
-            for (f, t) in serials.into_iter().enumerate() {
-                let size = serial_type_size(t);
-                let v = col_value(t, buf, i);
-                i += size;
-                state.on_col(ic, f, &v, rowid);
-            }
-            state.on_row();
-        } else if p.page_type == 0x05 {
-            let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
-            i += 4;
-            let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
-            let (rowid, j) = decode_varint(&buf[i..]);
-            i += j;
-            parse_cell_as_rows(&left_page, state, reader, db);
-            // eprintln!("0x05 interior key/rowid: {rowid}");
-        } else if p.page_type == 0x02 {
-            let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
-            i += 4;
-            let (size, j1) = decode_varint(buf);
-            i += j1;
-
-            let U = db.page_size as usize;
-            let X = ((U - 12) * 64 / 255) - 23;
-            let M = ((U - 12) * 32 / 255) - 23;
-            let P = size as usize;
-            let K = M + ((P - M) % (U - 4));
-            let mut onpage;
-            if P <= X {
-                // no overflow
-            } else if K <= X {
-                // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
-                onpage = buf[i..i + K].to_vec();
-                let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
-                while next != 0 {
-                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
-                    onpage.extend(&op.page[4..]);
-                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
-                }
-                buf = &onpage;
-                i = 0;
-            } else if K > X {
-                // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
-                onpage = buf[i..i + M].to_vec();
-                let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
-                while next != 0 {
-                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
-                    onpage.extend(&op.page[4..]);
-                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
-                }
-                buf = &onpage;
-                i = 0;
-            } else {
-                unreachable!();
-            }
-
-            // payload
-            // decode record header
-            let (header_size, j) = decode_varint(&buf[i..]);
-            i += j;
-            let mut serial_size = header_size as usize - j;
-            let mut serials = Vec::new();
-            while serial_size > 0 {
-                let (serial_type, j) = decode_varint(&buf[i..]);
-                i += j;
-                serial_size -= j;
-                serials.push(serial_type);
-            }
-            assert_eq!(serial_size, 0);
-
-            // decode record body
-            for (f, t) in serials.into_iter().enumerate() {
-                let size = serial_type_size(t);
-                let v = col_value(t, buf, i);
-                // for single column index:
-                // 0: key value
-                // 1: rowid
-                eprintln!("page type 0x02: {f}, value: {v}");
-                i += size;
-                state.on_col(ic, f, &v, -1);
-            }
-            state.on_row();
-            let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
-            parse_cell_as_rows(&left_page, state, reader, db);
-        } else if p.page_type == 0x0a {
-            // payload size
-            let (size, j1) = decode_varint(buf);
-            i += j1;
-
-            // payload body with overflow pages
-            let U = db.page_size as usize;
-            let X = ((U - 12) * 64 / 255) - 23;
-            let M = ((U - 12) * 32 / 255) - 23;
-            let P = size as usize;
-            let K = M + ((P - M) % (U - 4));
-            let mut onpage;
-            if P <= X {
-                // no overflow
-            } else if K <= X {
-                // the first K bytes of P are stored on the btree page and the remaining P-K bytes are stored on overflow pages.
-                onpage = buf[i..i + K].to_vec();
-                let mut next = u32::from_be_bytes(buf[i + K..i + K + 4].try_into().unwrap());
-                while next != 0 {
-                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
-                    onpage.extend(&op.page[4..]);
-                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
-                }
-                buf = &onpage;
-                i = 0;
-            } else if K > X {
-                // the first M bytes of P are stored on the btree page and the remaining P-M bytes are stored on overflow pages.
-                onpage = buf[i..i + M].to_vec();
-                let mut next = u32::from_be_bytes(buf[i + M..i + M + 4].try_into().unwrap());
-                while next != 0 {
-                    let op = parse_page(next as usize - 1, reader, &db, true).unwrap();
-                    onpage.extend(&op.page[4..]);
-                    next = u32::from_be_bytes(op.page[..4].try_into().unwrap());
-                }
-                buf = &onpage;
-                i = 0;
-            } else {
-                unreachable!();
-            }
-
-            // payload
-            // decode record header
-            let (header_size, j) = decode_varint(&buf[i..]);
-            i += j;
-            let mut serial_size = header_size as usize - j;
-            let mut serials = Vec::new();
-            while serial_size > 0 {
-                let (serial_type, j) = decode_varint(&buf[i..]);
-                i += j;
-                serial_size -= j;
-                serials.push(serial_type);
-            }
-            assert_eq!(serial_size, 0);
-
-            // decode record body
-            for (f, t) in serials.into_iter().enumerate() {
-                let size = serial_type_size(t);
-                let v = col_value(t, buf, i);
-                eprintln!("page_type: 0x0a: {f}, value:{v}");
-                i += size;
-                state.on_col(ic, f, &v, -1);
-            }
-            state.on_row();
-        } else {
-            unreachable!("parse cell for {}", p.page_type);
-        }
+        parse_one_cell(ic, *offset, p, state, reader, db);
     }
 
     if p.page_type == 0x05 || p.page_type == 0x02 {
