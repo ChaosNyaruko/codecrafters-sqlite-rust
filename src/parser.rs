@@ -9,7 +9,7 @@ pub struct SelectStmt {
     pub conditions: Vec<Condition>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Condition {
     pub column: String,
     pub op: String,

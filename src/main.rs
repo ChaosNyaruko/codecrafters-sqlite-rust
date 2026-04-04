@@ -111,26 +111,121 @@ impl<'r> OnColumn for Tables<'r> {
     fn set_type(&mut self, _t: u8) {}
 }
 
-fn scan_btree(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBInfo) {
+fn scan_btree(
+    p: &Page,
+    state: &mut dyn OnColumn,
+    reader: &File,
+    db: DBInfo,
+    cond: Option<&parser::Condition>,
+) {
     state.set_type(p.page_type);
     let cell_offsets = &p.cell_offsets;
 
-    // preorder traversal
-    for (ic, offset) in cell_offsets.into_iter().enumerate() {
-        let (key, left) = parse_one_cell(ic, *offset, p, state, reader, db);
-        if left > 0 {
-            assert!(p.page_type == 0x02 || p.page_type == 0x05);
-            // only for interior nodes
-            let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
-            scan_btree(&left_page, state, reader, db);
+    if p.page_type == 0x0d || p.page_type == 0x05 {
+        // table nodes
+        // preorder traversal
+        for (ic, offset) in cell_offsets.into_iter().enumerate() {
+            let (key, left) = parse_one_cell(ic, *offset, p, state, reader, db);
+            if left > 0 {
+                assert!(p.page_type == 0x02 || p.page_type == 0x05);
+                // only for interior nodes
+                let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
+                scan_btree(&left_page, state, reader, db, cond);
+            }
         }
-    }
+        if p.page_type == 0x05 || p.page_type == 0x02 {
+            let right_page = parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
+            scan_btree(&right_page, state, reader, db, cond);
+        }
+        state.finalize();
+    } else if p.page_type == 0x02 {
+        // interior index
+        // binary search
+        let target = cond.unwrap().value.clone();
+        // v = condition.value
+        // (key, left)
+        // v(target) <= key (left)
+        let mut l = 0;
+        let mut r = cell_offsets.len() - 1;
+        while l < r {
+            let m = l + (r - l) / 2;
+            let (key, left) = parse_one_cell(m, cell_offsets[m], p, state, reader, db);
+            // TODO: use string just for demo, we might want to
+            // define our own cmp for ColType
+            eprintln!("searching index 0x02 by target: {target} vs {key}, left:{left}");
+            // find the min key that greater than or (equal to) target
+            // 1 2 3 5 5 5 6 8
+            //      4^
+            if key.to_string() < target {
+                l = m + 1;
+            } else {
+                r = m;
+            }
+        }
+        assert_eq!(l, r);
+        // NOTE: we may want avoid the potential re-parse.
+        let (key, left) = parse_one_cell(l, cell_offsets[l], p, state, reader, db);
+        let next = if target > key.to_string() {
+            eprintln!(
+                "l: {}, len: {}, target {} > {}",
+                l,
+                cell_offsets.len(),
+                target,
+                key,
+            );
+            p.right.unwrap() as usize
+        } else {
+            eprintln!(
+                "l: {}, len: {}, target {} <= {}",
+                l,
+                cell_offsets.len(),
+                target,
+                key
+            );
+            left
+        };
+        let next_page = parse_page(next - 1, reader, &db, false).unwrap();
+        scan_btree(&next_page, state, reader, db, cond);
+    } else if p.page_type == 0xa {
+        let target = cond.unwrap().value.clone();
+        // cell_offsets
+        //     .iter()
+        //     .enumerate()
+        //     .map(|(ic, offset)| {
+        //         let (key, left) = parse_one_cell(ic, *offset, p, state, reader, db);
+        //         eprintln!("0x0a: target {target}: {key}, {left}")
+        //     })
+        //     .collect::<()>();
 
-    if p.page_type == 0x05 || p.page_type == 0x02 {
-        let right_page = parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
-        scan_btree(&right_page, state, reader, db);
+        // leaf index node
+        let mut l = 0;
+        let mut r = cell_offsets.len() - 1;
+        // for dup, find from the "smallest"
+        // 1 2 3 4 5 5 5 5 6
+        while l < r {
+            let m = l + (r - l) / 2;
+            let (key, _) = parse_one_cell(m, cell_offsets[m], p, state, reader, db);
+            // TODO: use string just for demo, we might want to
+            // define our own cmp for ColType
+            eprintln!("searching index 0x0a by target: {target} vs {key}");
+            if key.to_string() < target {
+                l = m + 1;
+            } else {
+                r = m;
+            }
+        }
+        loop {
+            let (key, rowid) = parse_one_cell(l, cell_offsets[l], p, state, reader, db);
+            if key.to_string() == target {
+                l += 1;
+                eprintln!("find one: {}, rowid: {rowid} for target {target}", key);
+            } else {
+                break;
+            }
+        }
+    } else {
+        unreachable!();
     }
-    state.finalize();
 }
 
 // -> key/rowid
@@ -342,7 +437,9 @@ fn parse_one_cell(
         assert_eq!(serial_size, 0);
 
         let mut res = ColType::Null;
+        let mut rowid = 0;
         // decode record body
+        // NOTE: we only support one-column index.
         for (f, t) in serials.into_iter().enumerate() {
             let size = serial_type_size(t);
             let v = col_value(t, buf, i);
@@ -350,11 +447,19 @@ fn parse_one_cell(
             if f == 0 {
                 res = v.clone();
             }
+            if f == 1 {
+                rowid = match v {
+                    ColType::Integer(vv) => vv as usize,
+                    _ => {
+                        panic!("rowid is an i64")
+                    }
+                };
+            }
             i += size;
             state.on_col(ic, f, &v, -1);
         }
         state.on_row();
-        return (res, 0);
+        return (res, rowid);
     } else {
         unreachable!("parse cell for {}", p.page_type);
     }
@@ -412,9 +517,9 @@ impl<'r> Tables<'r> {
             _ => unimplemented!(),
         };
         let mut cp = IndexCol {
-            conditions: conditions,
+            conditions: conditions.clone(),
         };
-        scan_btree(&p, &mut cp, self.reader, self.dbinfo);
+        scan_btree(&p, &mut cp, self.reader, self.dbinfo, Some(&conditions[0]));
         Ok(Vec::new())
     }
 
@@ -464,7 +569,7 @@ impl<'r> Tables<'r> {
             conditions: conditions,
             cur_type: 0,
         };
-        scan_btree(&p, &mut cp, self.reader, self.dbinfo);
+        scan_btree(&p, &mut cp, self.reader, self.dbinfo, None);
 
         Ok(())
     }
@@ -693,6 +798,8 @@ fn parse_page<'r>(
 }
 
 fn main() -> Result<()> {
+    // assert!("open" <= "one-side");
+    // panic!();
     // Parse arguments
     let args = std::env::args().collect::<Vec<_>>();
     match args.len() {
