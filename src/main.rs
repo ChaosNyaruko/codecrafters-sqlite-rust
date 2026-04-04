@@ -111,13 +111,15 @@ impl<'r> OnColumn for Tables<'r> {
     fn set_type(&mut self, _t: u8) {}
 }
 
+// scan_btree sometimes returns the found rowids, when the page type is leaf index (0x0a)
+// bad abstractions, but we are just demonstrating...
 fn scan_btree(
     p: &Page,
     state: &mut dyn OnColumn,
     reader: &File,
     db: DBInfo,
     cond: Option<&parser::Condition>,
-) {
+) -> Option<Vec<usize>> {
     state.set_type(p.page_type);
     let cell_offsets = &p.cell_offsets;
 
@@ -185,7 +187,7 @@ fn scan_btree(
             left
         };
         let next_page = parse_page(next - 1, reader, &db, false).unwrap();
-        scan_btree(&next_page, state, reader, db, cond);
+        return scan_btree(&next_page, state, reader, db, cond);
     } else if p.page_type == 0xa {
         let target = cond.unwrap().value.clone();
         // cell_offsets
@@ -214,18 +216,23 @@ fn scan_btree(
                 r = m;
             }
         }
+        let mut rowids = vec![];
         loop {
             let (key, rowid) = parse_one_cell(l, cell_offsets[l], p, state, reader, db);
             if key.to_string() == target {
                 l += 1;
                 eprintln!("find one: {}, rowid: {rowid} for target {target}", key);
+                rowids.push(rowid);
             } else {
                 break;
             }
         }
+        return Some(rowids);
     } else {
         unreachable!();
     }
+
+    return None;
 }
 
 // -> key/rowid
@@ -499,7 +506,7 @@ impl<'r> Tables<'r> {
         &self,
         index_name: &String,
         conditions: Vec<parser::Condition>,
-    ) -> Result<Vec<i64>, ()> {
+    ) -> Result<Option<Vec<usize>>> {
         let index = self
             .content
             .get(index_name)
@@ -516,11 +523,30 @@ impl<'r> Tables<'r> {
             Create::Index(c) => c,
             _ => unimplemented!(),
         };
-        let mut cp = IndexCol {
-            conditions: conditions.clone(),
-        };
-        scan_btree(&p, &mut cp, self.reader, self.dbinfo, Some(&conditions[0]));
-        Ok(Vec::new())
+
+        // simple index optimizer
+        // again, we only support one condition for now
+        eprintln!(
+            "cond: {:?}, t.columns: {:?}",
+            conditions[0].column, t.columns
+        );
+        let test = t.columns.iter().find(|v| **v == conditions[0].column);
+        eprintln!("test: {:?}", test);
+
+        if conditions.len() == 1
+            && t.columns
+                .iter()
+                .find(|v| **v == conditions[0].column)
+                .is_some()
+        {
+            let mut cp = IndexCol {
+                conditions: conditions.clone(),
+            };
+            let rowid = scan_btree(&p, &mut cp, self.reader, self.dbinfo, Some(&conditions[0]));
+            return Ok(rowid);
+        } else {
+            return Err(anyhow::anyhow!("no index usable"));
+        }
     }
 
     fn select(
@@ -841,11 +867,17 @@ fn main() -> Result<()> {
                 tables.indexes, tables.pos, tables.content, table
             );
             if let Some(c) = tables.indexes.get(&table) {
-                let v = tables
-                    .select_by_index(&c.1, select.conditions)
-                    .expect("select by index error");
+                if let Ok(rowids) = tables.select_by_index(&c.1, select.conditions.clone()) {
+                    println!("searching through index and get rowids: {:?}", rowids);
+                    if rowids.is_none() {
+                        // we can use index, don't find anything.
+                        eprintln!("Don't find any items");
+                        return Ok(());
+                    } else if rowids.is_some() {
+                        todo!("parse index page complete, search next");
+                    }
+                }
             }
-            todo!("parse index page complete, search next");
             tables
                 .select(&table, select.columns, select.conditions)
                 .unwrap_or_else(|_| {
