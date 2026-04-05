@@ -6,6 +6,12 @@ use std::io::{SeekFrom, prelude::*};
 mod parser;
 
 #[derive(Debug, Clone)]
+enum SelectBy {
+    Conditions(Vec<parser::Condition>),
+    RowIds(Vec<usize>),
+}
+
+#[derive(Debug, Clone)]
 enum Create {
     Table(parser::CreateTableStmt),
     Index(parser::CreateIndexStmt),
@@ -33,14 +39,13 @@ struct Tables<'r> {
 }
 
 trait OnColumn {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64);
-    fn on_row(&mut self);
+    fn on_col(&mut self, cur_type: u8, row: usize, col: usize, v: &ColType, rowid: i64);
+    fn on_row(&mut self, cur_type: u8, rowid: i64);
     fn finalize(&mut self);
-    fn set_type(&mut self, t: u8);
 }
 
 impl<'r> OnColumn for Tables<'r> {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
+    fn on_col(&mut self, cur_type: u8, row: usize, col: usize, v: &ColType, rowid: i64) {
         // schema: type name tbl_name rootpage sql
         if col == 0 {
             self.create_type = v.to_string()
@@ -85,7 +90,7 @@ impl<'r> OnColumn for Tables<'r> {
         }
     }
 
-    fn on_row(&mut self) {
+    fn on_row(&mut self, _: u8, _rowid: i64) {
         eprintln!(
             "cur_name:{}, cur_create:{:?}",
             self.cur_name, self.cur_create
@@ -107,8 +112,6 @@ impl<'r> OnColumn for Tables<'r> {
     }
 
     fn finalize(&mut self) {}
-
-    fn set_type(&mut self, _t: u8) {}
 }
 
 // scan_btree sometimes returns the found rowids, when the page type is leaf index (0x0a)
@@ -118,32 +121,113 @@ fn scan_btree(
     state: &mut dyn OnColumn,
     reader: &File,
     db: DBInfo,
-    cond: Option<&parser::Condition>,
-) -> Option<Vec<usize>> {
-    state.set_type(p.page_type);
+    index_cond: Option<&parser::Condition>,
+    rowid: Option<usize>,
+) -> Vec<usize> {
     let cell_offsets = &p.cell_offsets;
 
     if p.page_type == 0x0d || p.page_type == 0x05 {
         // table nodes
-        // preorder traversal
-        for (ic, offset) in cell_offsets.into_iter().enumerate() {
-            let (key, left) = parse_one_cell(ic, *offset, p, state, reader, db);
-            if left > 0 {
-                assert!(p.page_type == 0x02 || p.page_type == 0x05);
-                // only for interior nodes
-                let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
-                scan_btree(&left_page, state, reader, db, cond);
+        if rowid.is_none() {
+            // preorder traversal for full scan
+            for (ic, offset) in cell_offsets.into_iter().enumerate() {
+                let (key, left) = parse_one_cell(ic, *offset, p, state, reader, db);
+                state.on_row(p.page_type, -1);
+                if left > 0 {
+                    assert!(p.page_type == 0x02 || p.page_type == 0x05);
+                    // only for interior nodes
+                    let left_page = parse_page(left as usize - 1, reader, &db, false).unwrap();
+                    scan_btree(&left_page, state, reader, db, index_cond, rowid);
+                }
+            }
+            if p.page_type == 0x05 || p.page_type == 0x02 {
+                let right_page =
+                    parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
+                scan_btree(&right_page, state, reader, db, index_cond, rowid);
+            }
+            state.finalize();
+        } else {
+            let rowid = rowid.unwrap();
+            let target = rowid;
+            if p.page_type == 0x05 {
+                // interior
+                let mut l = 0;
+                let mut r = cell_offsets.len() - 1;
+                while l < r {
+                    let m = l + (r - l) / 2;
+                    let (key, left) = parse_one_cell(m, cell_offsets[m], p, state, reader, db);
+                    let key: usize = key.try_into().unwrap();
+                    eprintln!("searching table 0x05 by rowid: {rowid} vs {key}, left:{left}");
+                    // find the min key that greater than or (equal to) target
+                    // 1 2 3 5 5 5 6 8
+                    //      4^
+                    if key < target {
+                        l = m + 1;
+                    } else {
+                        r = m;
+                    }
+                }
+                assert_eq!(l, r);
+                // NOTE: we may want avoid the potential re-parse.
+                let (key, left) = parse_one_cell(l, cell_offsets[l], p, state, reader, db);
+                let key: usize = key.try_into().unwrap();
+                state.on_row(p.page_type, key as i64);
+                let next = if target > key {
+                    eprintln!(
+                        "l: {}, len: {}, target {} > {}",
+                        l,
+                        cell_offsets.len(),
+                        target,
+                        key,
+                    );
+                    p.right.unwrap() as usize
+                } else {
+                    eprintln!(
+                        "l: {}, len: {}, target {} <= {}",
+                        l,
+                        cell_offsets.len(),
+                        target,
+                        key
+                    );
+                    left
+                };
+                let next_page = parse_page(next - 1, reader, &db, false).unwrap();
+                return scan_btree(&next_page, state, reader, db, index_cond, Some(rowid));
+            } else {
+                // leaf 0x0d
+                let mut l = 0;
+                let mut r = cell_offsets.len() - 1;
+                // for dup, find from the "smallest"
+                // 1 2 3 4 5 5 5 5 6
+                while l < r {
+                    let m = l + (r - l) / 2;
+                    let (key, _) = parse_one_cell(m, cell_offsets[m], p, state, reader, db);
+                    let key: usize = key.try_into().unwrap();
+                    eprintln!("searching table leaf 0x0d by target: {target} vs {key}");
+                    if key < target {
+                        l = m + 1;
+                    } else {
+                        r = m;
+                    }
+                }
+                assert_eq!(l, r);
+                while l < cell_offsets.len() {
+                    let (rowid, _) = parse_one_cell(l, cell_offsets[l], p, state, reader, db);
+                    let key: usize = rowid.try_into().unwrap();
+                    state.on_row(p.page_type, key as i64);
+                    if key == target {
+                        eprintln!("post searching table leaf 0x0d by target: {target} vs {key}");
+                        l += 1;
+                    } else {
+                        break;
+                    }
+                }
             }
         }
-        if p.page_type == 0x05 || p.page_type == 0x02 {
-            let right_page = parse_page(p.right.unwrap() as usize - 1, reader, &db, false).unwrap();
-            scan_btree(&right_page, state, reader, db, cond);
-        }
-        state.finalize();
     } else if p.page_type == 0x02 {
         // interior index
         // binary search
-        let target = cond.unwrap().value.clone();
+        let target = index_cond.unwrap().value.clone();
         // v = condition.value
         // (key, left)
         // v(target) <= key (left)
@@ -187,9 +271,9 @@ fn scan_btree(
             left
         };
         let next_page = parse_page(next - 1, reader, &db, false).unwrap();
-        return scan_btree(&next_page, state, reader, db, cond);
+        return scan_btree(&next_page, state, reader, db, index_cond, rowid);
     } else if p.page_type == 0xa {
-        let target = cond.unwrap().value.clone();
+        let target = index_cond.unwrap().value.clone();
         // cell_offsets
         //     .iter()
         //     .enumerate()
@@ -217,7 +301,7 @@ fn scan_btree(
             }
         }
         let mut rowids = vec![];
-        loop {
+        while l < cell_offsets.len() {
             let (key, rowid) = parse_one_cell(l, cell_offsets[l], p, state, reader, db);
             if key.to_string() == target {
                 l += 1;
@@ -227,12 +311,12 @@ fn scan_btree(
                 break;
             }
         }
-        return Some(rowids);
+        return rowids;
     } else {
         unreachable!();
     }
 
-    return None;
+    return Vec::default();
 }
 
 // -> key/rowid
@@ -245,6 +329,9 @@ fn parse_one_cell(
     reader: &File,
     db: DBInfo,
 ) -> (ColType, usize) {
+    let mut res = ColType::Null;
+    let mut left: usize = 0;
+
     let page = &p.page;
     let mut buf = &page[offset as usize..];
     let mut i = 0;
@@ -307,18 +394,18 @@ fn parse_one_cell(
             let size = serial_type_size(t);
             let v = col_value(t, buf, i);
             i += size;
-            state.on_col(ic, f, &v, rowid);
+            state.on_col(p.page_type, ic, f, &v, rowid);
         }
-        state.on_row();
-        return (ColType::Null, 0);
+        res = ColType::Integer(rowid);
     } else if p.page_type == 0x05 {
-        let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
+        let lefta = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
         i += 4;
         let (rowid, j) = decode_varint(&buf[i..]);
         i += j;
-        return (ColType::Integer(rowid), left as usize);
+        res = ColType::Integer(rowid);
+        left = lefta as usize;
     } else if p.page_type == 0x02 {
-        let left = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
+        let lefta = u32::from_be_bytes(buf[i..i + 4].try_into().unwrap());
         i += 4;
         let (size, j1) = decode_varint(buf);
         i += j1;
@@ -371,7 +458,6 @@ fn parse_one_cell(
         }
         assert_eq!(serial_size, 0);
 
-        let mut res = ColType::Null;
         // decode record body
         for (f, t) in serials.into_iter().enumerate() {
             let size = serial_type_size(t);
@@ -385,10 +471,9 @@ fn parse_one_cell(
                 res = v.clone();
             }
             i += size;
-            state.on_col(ic, f, &v, -1);
+            state.on_col(p.page_type, ic, f, &v, -1);
         }
-        state.on_row();
-        return (res, left as usize);
+        left = lefta as usize
     } else if p.page_type == 0x0a {
         // payload size
         let (size, j1) = decode_varint(buf);
@@ -443,7 +528,6 @@ fn parse_one_cell(
         }
         assert_eq!(serial_size, 0);
 
-        let mut res = ColType::Null;
         let mut rowid = 0;
         // decode record body
         // NOTE: we only support one-column index.
@@ -463,20 +547,21 @@ fn parse_one_cell(
                 };
             }
             i += size;
-            state.on_col(ic, f, &v, -1);
+            state.on_col(p.page_type, ic, f, &v, -1);
         }
-        state.on_row();
-        return (res, rowid);
+        left = rowid;
     } else {
         unreachable!("parse cell for {}", p.page_type);
     }
+
+    return (res, left);
 }
 
-fn parse_cell_as_rows(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBInfo) {
-    state.set_type(p.page_type);
+fn parse_cell_as_tables(p: &Page, state: &mut dyn OnColumn, reader: &File, db: DBInfo) {
     let cell_offsets = &p.cell_offsets;
     for (ic, offset) in cell_offsets.into_iter().enumerate() {
         parse_one_cell(ic, *offset, p, state, reader, db);
+        state.on_row(p.page_type, -1);
     }
     state.finalize();
 }
@@ -497,16 +582,16 @@ impl<'r> Tables<'r> {
             indexes: HashMap::new(),
         };
 
-        parse_cell_as_rows(p, &mut res, reader, *db);
+        parse_cell_as_tables(p, &mut res, reader, *db);
         // eprintln!("table: {:?}", res);
         return Some(res);
     }
 
-    fn select_by_index(
+    fn select_rowids_by_index(
         &self,
         index_name: &String,
         conditions: Vec<parser::Condition>,
-    ) -> Result<Option<Vec<usize>>> {
+    ) -> Result<Vec<usize>> {
         let index = self
             .content
             .get(index_name)
@@ -542,20 +627,21 @@ impl<'r> Tables<'r> {
             let mut cp = IndexCol {
                 conditions: conditions.clone(),
             };
-            let rowid = scan_btree(&p, &mut cp, self.reader, self.dbinfo, Some(&conditions[0]));
+            let rowid = scan_btree(
+                &p,
+                &mut cp,
+                self.reader,
+                self.dbinfo,
+                Some(&conditions[0]),
+                None,
+            );
             return Ok(rowid);
         } else {
             return Err(anyhow::anyhow!("no index usable"));
         }
     }
 
-    fn select(
-        &self,
-        table: &String,
-        cols: Vec<String>,
-        conditions: Vec<parser::Condition>,
-    ) -> Result<()> {
-        eprintln!("conds: {:?}", conditions);
+    fn select(&self, table: &String, cols: Vec<String>, select_by: SelectBy) -> Result<()> {
         let tables = self
             .content
             .get(table)
@@ -592,28 +678,35 @@ impl<'r> Tables<'r> {
             schema: t.columns.clone(),
             per_row: vec!["".to_string(); len],
             filtered: false,
-            conditions: conditions,
-            cur_type: 0,
+            select_by: select_by.clone(),
         };
-        scan_btree(&p, &mut cp, self.reader, self.dbinfo, None);
-
+        match select_by {
+            SelectBy::Conditions(_) => {
+                scan_btree(&p, &mut cp, self.reader, self.dbinfo, None, None);
+            }
+            SelectBy::RowIds(rowids) => {
+                for rowid in rowids {
+                    eprintln!("XXrowid : {:?}", rowid);
+                    cp.select_by = SelectBy::RowIds(vec![rowid]);
+                    scan_btree(&p, &mut cp, self.reader, self.dbinfo, None, Some(rowid));
+                }
+            }
+        }
         Ok(())
     }
 }
 
 struct MockCol;
 impl OnColumn for MockCol {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
+    fn on_col(&mut self, _: u8, row: usize, col: usize, v: &ColType, rowid: i64) {
         eprintln!("on_col {row}, {col}, {v}");
     }
 
-    fn on_row(&mut self) {
+    fn on_row(&mut self, _: u8, _: i64) {
         eprintln!("on_row");
     }
 
     fn finalize(&mut self) {}
-
-    fn set_type(&mut self, t: u8) {}
 }
 
 struct IndexCol {
@@ -621,17 +714,15 @@ struct IndexCol {
 }
 
 impl OnColumn for IndexCol {
-    fn on_col(&mut self, row: usize, col: usize, v: &ColType, rowid: i64) {
+    fn on_col(&mut self, cur_type: u8, row: usize, col: usize, v: &ColType, rowid: i64) {
         eprintln!("on_col {row}, {col}, {v}");
     }
 
-    fn on_row(&mut self) {
+    fn on_row(&mut self, cur_type: u8, _: i64) {
         eprintln!("on_row");
     }
 
     fn finalize(&mut self) {}
-
-    fn set_type(&mut self, t: u8) {}
 }
 
 struct ColsPrint {
@@ -639,12 +730,11 @@ struct ColsPrint {
     schema: Vec<parser::ColumnDef>,
     per_row: Vec<String>,
     filtered: bool,
-    conditions: Vec<parser::Condition>,
-    cur_type: u8,
+    select_by: SelectBy,
 }
 
 impl OnColumn for ColsPrint {
-    fn on_col(&mut self, row: usize, col: usize, rv: &ColType, rowid: i64) {
+    fn on_col(&mut self, cur_type: u8, row: usize, col: usize, rv: &ColType, rowid: i64) {
         let v = if let ColType::Null = rv {
             &ColType::Integer(rowid)
         } else {
@@ -652,36 +742,44 @@ impl OnColumn for ColsPrint {
         };
         eprintln!(
             "on_col: 0x{:0x}, {}, row: {}, col: {}, rowid: {}",
-            self.cur_type, row, col, v, rowid
+            cur_type, row, col, v, rowid
         );
-        // [3,1,2]
-        // [1,2,3]
-        // stored: name, color
-        // select: color name
-        // select name from xxx where color = 'Yellow';
-        // TODO: We only support AND for now.
-        if self.cur_type == 0x0d {
-            for cond in &self.conditions {
-                assert_eq!(cond.op, "=");
-                let c = self
-                    .schema
-                    .iter()
-                    .enumerate()
-                    .find(|c| c.1.name == cond.column)
-                    .expect(&format!("cannot find the condtion {}", cond.column));
-                if c.0 != col {
-                    continue;
+        if cur_type == 0x0d {
+            // [3,1,2]
+            // [1,2,3]
+            // stored: name, color
+            // select: color name
+            // select name from xxx where color = 'Yellow';
+            // TODO: We only support AND for now.
+            match &self.select_by {
+                SelectBy::Conditions(conditions) => {
+                    for cond in conditions {
+                        assert_eq!(cond.op, "=");
+                        let c = self
+                            .schema
+                            .iter()
+                            .enumerate()
+                            .find(|c| c.1.name == cond.column)
+                            .expect(&format!("cannot find the condtion {}", cond.column));
+                        if c.0 != col {
+                            continue;
+                        }
+                        eprintln!(
+                            "{} vs {}: {} vs {}",
+                            cond.column,
+                            c.1.name,
+                            cond.value,
+                            v.to_string()
+                        );
+                        if v.to_string() != cond.value {
+                            self.filtered = true;
+                            break;
+                        }
+                    }
                 }
-                eprintln!(
-                    "{} vs {}: {} vs {}",
-                    cond.column,
-                    c.1.name,
-                    cond.value,
-                    v.to_string()
-                );
-                if v.to_string() != cond.value {
-                    self.filtered = true;
-                    break;
+                SelectBy::RowIds(_) => {
+                    // NOTE: we do nothing here, we do the filter at on_row,
+                    // to avoid re-assgining ".filter" and messing up.
                 }
             }
             if let Some((i, col)) = self
@@ -695,22 +793,33 @@ impl OnColumn for ColsPrint {
         }
     }
 
-    fn on_row(&mut self) {
-        if self.cur_type == 0x0d {
+    fn on_row(&mut self, cur_type: u8, rowid: i64) {
+        if cur_type == 0x0d {
+            eprintln!(
+                "0x0d search: {:?}, filterd: {:?}, per_row: {:?}",
+                self.select_by, self.filtered, self.per_row
+            );
+            match &self.select_by {
+                SelectBy::RowIds(rowids) => {
+                    assert_eq!(rowids.len(), 1);
+                    let target = rowids[0];
+                    eprintln!("on_col search filter {target} vs {rowid}");
+                    if target != rowid as usize {
+                        self.filtered = true
+                    }
+                }
+                _ => {}
+            }
             if !self.filtered {
                 println!("{}", self.per_row.join("|"));
             }
             self.per_row.resize(self.per_row.len(), "".to_string());
             self.filtered = false;
         }
+        self.filtered = false;
     }
 
     fn finalize(&mut self) {}
-
-    fn set_type(&mut self, t: u8) {
-        // eprintln!("set type: {}", t);
-        self.cur_type = t
-    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -740,7 +849,7 @@ fn parse_dbinfo(reader: &mut File) -> Result<DBInfo> {
     if text_encoding != 1 {
         panic!("unsupported text encoding {}", text_encoding);
     }
-    assert_eq!(header[20], 0); // Bytes of unused "reserved" space at the end of each page. Usually 0. 
+    assert_eq!(header[20], 0); // Bytes of unused "reserved" space at the end of each page. Usually 0.
 
     // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
     #[allow(unused_variables)]
@@ -866,30 +975,51 @@ fn main() -> Result<()> {
                 "indexes: {:?}, pos: {:?}, content: {:?}, table: {}",
                 tables.indexes, tables.pos, tables.content, table
             );
-            if let Some(c) = tables.indexes.get(&table) {
-                if let Ok(rowids) = tables.select_by_index(&c.1, select.conditions.clone()) {
-                    println!("searching through index and get rowids: {:?}", rowids);
-                    if rowids.is_none() {
-                        // we can use index, don't find anything.
-                        eprintln!("Don't find any items");
-                        return Ok(());
-                    } else if rowids.is_some() {
-                        todo!("parse index page complete, search next");
+            let rowids = if let Some(c) = tables.indexes.get(&table) {
+                match tables.select_rowids_by_index(&c.1, select.conditions.clone()) {
+                    Ok(rowids) => {
+                        eprintln!("searching through index and get rowids: {:?}", rowids);
+                        if rowids.len() == 0 {
+                            // we can use index, don't find anything.
+                            eprintln!("Don't find any items");
+                            return Ok(());
+                        } else {
+                            Some(rowids)
+                        }
+                    }
+                    Err(info) => {
+                        // we have index on this table, but not on this particular column
+                        eprintln!("{}", info);
+                        None
                     }
                 }
+            } else {
+                // we don't have index definitions on this table
+                None
+            };
+
+            if rowids.is_some() {
+                tables
+                    .select(&table, select.columns, SelectBy::RowIds(rowids.unwrap()))
+                    .expect("we must find some rows after we have rowids(through index)")
+            } else {
+                tables
+                    .select(
+                        &table,
+                        select.columns,
+                        SelectBy::Conditions(select.conditions),
+                    )
+                    .unwrap_or_else(|_| {
+                        let root = tables
+                            .pos
+                            .get(&table)
+                            .expect(&format!("{} not exists", table));
+                        let p = parse_page(*root - 1, &mut file, &db, false)
+                            .context("parse page err")
+                            .unwrap();
+                        println!("{}", p.cell_num);
+                    });
             }
-            tables
-                .select(&table, select.columns, select.conditions)
-                .unwrap_or_else(|_| {
-                    let root = tables
-                        .pos
-                        .get(&table)
-                        .expect(&format!("{} not exists", table));
-                    let p = parse_page(*root - 1, &mut file, &db, false)
-                        .context("parse page err")
-                        .unwrap();
-                    println!("{}", p.cell_num);
-                });
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
@@ -916,6 +1046,28 @@ impl fmt::Display for ColType {
             ColType::Reserved => write!(f, "RESERVED"),
             ColType::Blob(size) => write!(f, "BLOB({size})"),
             ColType::Text(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl TryFrom<ColType> for i64 {
+    type Error = anyhow::Error;
+
+    fn try_from(v: ColType) -> anyhow::Result<Self> {
+        match v {
+            ColType::Integer(n) => Ok(n),
+            other => Err(anyhow::anyhow!("expected Integer, got {}", other)),
+        }
+    }
+}
+
+impl TryFrom<ColType> for usize {
+    type Error = anyhow::Error;
+
+    fn try_from(v: ColType) -> anyhow::Result<Self> {
+        match v {
+            ColType::Integer(n) => Ok(n as usize),
+            other => Err(anyhow::anyhow!("expected Integer, got {}", other)),
         }
     }
 }
